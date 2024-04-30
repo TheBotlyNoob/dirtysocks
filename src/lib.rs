@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{convert::Infallible, net::SocketAddr};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -6,14 +6,15 @@ use tokio::{
 };
 use untrusted::Input;
 
-const USERNAME_PASSWORD_METHOD: u8 = 0x02;
+pub const SOCKS_VERSION: u8 = 0x05;
+pub const USERNAME_PASSWORD_VERSION: u8 = 0x01;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("invalid socks5 protocol")]
-    Socks5Protocol,
+    #[error("authentication method not found")]
+    AuthMethodNotFound,
     #[error("invalid username or password")]
     InvalidCredentials,
     #[error("invalid version")]
@@ -50,91 +51,103 @@ impl Socks5Server {
 
     pub async fn listen(&self) {
         loop {
-            let (stream, client_addr) = self.listener.accept().await.unwrap();
-            tokio::spawn(Self::handle_request(
-                stream,
-                client_addr,
-                self.username.clone(),
-                self.password.clone(),
-            ));
+            while let Ok((stream, client_addr)) = self.listener.accept().await {
+                tokio::spawn(
+                    TcpClientHandler::new(
+                        stream,
+                        client_addr,
+                        self.username.clone(),
+                        self.password.clone(),
+                    )
+                    .run(),
+                );
+            }
         }
     }
+}
 
-    async fn handle_request(
-        mut stream: TcpStream,
-        _client_addr: SocketAddr,
-        username: String,
-        password: String,
-    ) -> Result<(), Error> {
-        let mut buffer = [0; 1024];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum AuthMethod {
+    NoAuthRequired = 0x00,
+    GssApi = 0x01,
+    UsernamePassword = 0x02,
+    NoneAcceptable = 0xFF,
+}
 
-        let n = stream.read(&mut buffer).await?;
+struct TcpClientHandler {
+    stream: TcpStream,
+    client_addr: SocketAddr,
+    buf: [u8; 1024],
+    username: String,
+    password: String,
+}
+impl TcpClientHandler {
+    fn new(stream: TcpStream, client_addr: SocketAddr, username: String, password: String) -> Self {
+        Self {
+            stream,
+            client_addr,
+            buf: [0; 1024],
+            username,
+            password,
+        }
+    }
+    async fn run(mut self) -> Result<Infallible, Error> {
+        self.init_conn().await?;
+        loop {}
+    }
+    /// Authorizes with the client and checks version.
+    async fn init_conn(&mut self) -> Result<bool, Error> {
+        let input = self.stream.read(&mut self.buf).await?;
+        let input = Input::from(&self.buf[..input]);
 
-        let input = Input::from(&buffer[..n]);
+        let method = Self::parse_initial_packet(input)?;
 
-        let version = input.read_all(Error::IncompleteRead, |input| {
-            let version = input.read_byte()?;
-            let nmethods = input.read_byte()?;
-            let methods = input.read_bytes(nmethods as usize)?;
+        self.stream
+            .write_all(&[SOCKS_VERSION, method as u8])
+            .await?;
+        if method == AuthMethod::NoneAcceptable {
+            return Err(Error::AuthMethodNotFound);
+        }
 
-            if version != 0x05 {
+        todo!();
+    }
+
+    fn parse_username_password_request(input: Input<'_>) -> Result<(&[u8], &[u8]), Error> {
+        input.read_all(Error::IncompleteRead, |reader| {
+            let version 
+        })
+    }
+
+    fn parse_initial_packet(input: Input<'_>) -> Result<AuthMethod, Error> {
+        input.read_all(Error::IncompleteRead, |reader| {
+            let version = reader.read_byte()?;
+            let nmethods = reader.read_byte()?;
+            let methods = reader.read_bytes(nmethods as usize)?;
+
+            if version != SOCKS_VERSION {
                 return Err(Error::InvalidVersion);
             }
 
-            debug_assert_eq!(nmethods, methods.len() as u8);
+            if Self::contains_method(methods, AuthMethod::UsernamePassword) {
+                Ok(AuthMethod::UsernamePassword)
+            } else {
+                Ok(AuthMethod::NoneAcceptable)
+            }
+        })
+    }
 
-            methods.read_all(Error::IncompleteRead, |methods| {
-                while let Ok(method) = methods.read_byte() {
-                    if method == USERNAME_PASSWORD_METHOD {
-                        methods.skip_to_end();
-                        return Ok(());
+    fn contains_method(input: Input<'_>, method: AuthMethod) -> bool {
+        input
+            .read_all((), |reader| {
+                while let Ok(allowed_method) = reader.read_byte() {
+                    if allowed_method == method as u8 {
+                        reader.skip_to_end();
+                        return Ok(true);
                     }
                 }
-                Err(Error::Socks5Protocol)
-            })?; // we found it
-
-            Ok(version)
-        })?;
-
-        stream
-            .write_all(&[version, USERNAME_PASSWORD_METHOD])
-            .await?;
-
-        let n = stream.read(&mut buffer).await?;
-
-        let input = Input::from(&buffer[..n]);
-
-        let auth = input.read_all(Error::IncompleteRead, |input| {
-            let version = input.read_byte()?;
-            let ulen = input.read_byte()?;
-            let given_username = input.read_bytes(ulen as usize)?;
-            let plen = input.read_byte()?;
-            let given_password = input.read_bytes(plen as usize)?;
-
-            if version != 0x01 {
-                return Err(Error::InvalidVersion);
-            }
-
-            if given_username.as_slice_less_safe() != username.as_bytes()
-                || given_password.as_slice_less_safe() != password.as_bytes()
-            {
-                return Err(Error::InvalidCredentials);
-            }
-
-            Ok(())
-        });
-
-        match auth {
-            Ok(_) => {
-                stream.write_all(&[0x01, 0x00]).await?;
-            }
-            Err(Error::InvalidCredentials) => {
-                stream.write_all(&[0x01, 0x01]).await?;
-                stream.shutdown().await?;
-            }
-            Err(e) => return Err(e),
-        };
-
-        Ok(())
+                Ok(false)
+            })
+            .unwrap_or(false)
     }
 }
