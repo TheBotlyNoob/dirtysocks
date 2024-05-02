@@ -434,13 +434,9 @@ impl ClientHandler {
                 return Err(Error::InvalidVersion);
             }
 
-            if use_auth {
-                if Self::contains_method(methods, AuthMethod::UsernamePassword) {
-                    Ok(AuthMethod::UsernamePassword)
-                } else {
-                    Ok(AuthMethod::NoneAcceptable)
-                }
-            } else if Self::contains_method(methods, AuthMethod::NoAuthRequired) {
+            if use_auth && Self::contains_method(methods, AuthMethod::UsernamePassword) {
+                Ok(AuthMethod::UsernamePassword)
+            } else if !use_auth && Self::contains_method(methods, AuthMethod::NoAuthRequired) {
                 Ok(AuthMethod::NoAuthRequired)
             } else {
                 Ok(AuthMethod::NoneAcceptable)
