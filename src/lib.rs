@@ -1,5 +1,13 @@
+#![warn(clippy::pedantic, clippy::nursery)]
+
+use boringtun::noise::Tunn;
 use hickory_resolver::TokioAsyncResolver;
 use seq_macro::seq;
+use smoltcp::{
+    iface::{self, Config},
+    time::Instant,
+    wire::HardwareAddress,
+};
 use std::{
     convert::Infallible,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -8,9 +16,13 @@ use std::{
 use strum::FromRepr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
+    sync::mpsc,
 };
 use untrusted::Input;
+use wg::{PacketToClient, PacketToPeer, Peer};
+
+pub mod wg;
 
 pub const SOCKS_VERSION: u8 = 0x05;
 pub const USERNAME_PASSWORD_VERSION: u8 = 0x01;
@@ -35,16 +47,16 @@ pub enum Error {
     InvalidCommandType,
     #[error("invalid string")]
     Utf8(#[from] std::str::Utf8Error),
-    #[error("dns lookup")]
+    #[error("dns lookup error: {0}")]
     DnsLookup(#[from] hickory_resolver::error::ResolveError),
     #[error("no such host")]
     NoSuchHost,
-    #[error("timeout")]
+    #[error("timeout: {0}")]
     Timeout(#[from] tokio::time::error::Elapsed),
 }
 impl From<untrusted::EndOfInput> for Error {
     fn from(_: untrusted::EndOfInput) -> Self {
-        Error::UnexpectedEOI
+        Self::UnexpectedEOI
     }
 }
 
@@ -54,29 +66,44 @@ pub struct UserPass {
     pub password: String,
 }
 
-pub struct Socks5Server {
+/// A Socks5 server implementation, sending data to a single `WireGuard` peer.
+pub struct Server {
     pub listener: TcpListener,
+    pub wg_peer: wg::Peer,
+    pub on_packet: mpsc::Sender<PacketToPeer>,
     pub resolver: TokioAsyncResolver,
     pub timeout: Duration,
     pub user_pass: Option<UserPass>,
 }
 
-impl Socks5Server {
-    pub fn new(
+impl Server {
+    pub async fn new(
         listener: TcpListener,
+        wg_tunn: Tunn,
+        wg_addr: SocketAddr,
         resolver: TokioAsyncResolver,
         timeout: Duration,
         user_pass: Option<UserPass>,
-    ) -> Self {
-        Socks5Server {
+    ) -> Result<Self, Error> {
+        let peer_conn = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
+        peer_conn.connect(wg_addr).await?;
+
+        let (on_packet_tx, on_packet_rx) = mpsc::channel(50);
+
+        let peer = Peer::new(wg_tunn, wg_addr, peer_conn, on_packet_rx);
+
+        Ok(Self {
             listener,
+            wg_peer: peer,
+            on_packet: on_packet_tx,
             resolver,
             timeout,
             user_pass,
-        }
+        })
     }
 
-    pub async fn listen(&self) {
+    #[allow(clippy::redundant_pub_crate)]
+    pub async fn listen(&mut self) -> ! {
         tracing::info!("SOCKS5 server started");
         if self.user_pass.is_some() {
             tracing::info!("using username/password authentication");
@@ -85,17 +112,28 @@ impl Socks5Server {
         }
 
         loop {
-            while let Ok((stream, client_addr)) = self.listener.accept().await {
-                tokio::spawn(
-                    ClientHandler::new(
-                        stream,
-                        client_addr,
-                        self.resolver.clone(),
-                        self.timeout,
-                        self.user_pass.clone(),
-                    )
-                    .run(),
-                );
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if let Err(e) = self.wg_peer.update_timers().await {
+                        tracing::error!(?e, "failed updating timers");
+                    };
+                }
+                Ok((stream, client_addr)) = self.listener.accept() => {
+                    let (packet_tx, packet_rx) = mpsc::channel(50);
+                    self.wg_peer.add_client_addr(client_addr, packet_tx);
+
+                    tokio::spawn(
+                        ClientHandler::new(
+                            stream,
+                            client_addr,
+                            self.resolver.clone(),
+                            self.timeout,
+                            packet_rx,
+                            self.user_pass.clone(),
+                        )
+                        .run(),
+                    );
+                }
             }
         }
     }
@@ -137,7 +175,7 @@ enum CommandType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Command<'input> {
     addr: Address<'input>,
-    command: CommandType,
+    ty: CommandType,
     version: u8,
 }
 
@@ -176,16 +214,17 @@ struct Command<'input> {
 ///        o  BND.ADDR       server bound address
 ///        o  BND.PORT       server bound port in network octet order
 /// ```
-pub struct Socks5Reply {
+pub struct Reply {
     pub version: u8,
     pub reply: u8,
     pub reserved: u8,
     pub address: SocketAddr,
 }
 
-impl Socks5Reply {
-    pub fn new(reply: u8, address: SocketAddr) -> Self {
-        Socks5Reply {
+impl Reply {
+    #[must_use]
+    pub const fn new(reply: u8, address: SocketAddr) -> Self {
+        Self {
             version: SOCKS_VERSION,
             reply,
             reserved: 0,
@@ -193,6 +232,7 @@ impl Socks5Reply {
         }
     }
 
+    #[must_use]
     pub fn to_bytes(&self) -> ([u8; 6 + 16], usize) {
         let mut buf = [0; 6 + 16]; // 6 bytes for fixed fields, 16 for a possible ipv6 address
         let addr_len = if self.address.is_ipv4() { 4 } else { 16 };
@@ -218,15 +258,17 @@ struct ClientHandler {
     client_addr: SocketAddr,
     resolver: TokioAsyncResolver,
     timeout: Duration,
+    wg_packet_recver: mpsc::Receiver<PacketToClient>,
     buf: [u8; 1024],
     user_pass: Option<UserPass>,
 }
 impl ClientHandler {
-    fn new(
+    const fn new(
         stream: TcpStream,
         client_addr: SocketAddr,
         resolver: TokioAsyncResolver,
         timeout: Duration,
+        wg_packet_recver: mpsc::Receiver<PacketToClient>,
         user_pass: Option<UserPass>,
     ) -> Self {
         Self {
@@ -234,6 +276,7 @@ impl ClientHandler {
             client_addr,
             resolver,
             timeout,
+            wg_packet_recver,
             buf: [0; 1024],
             user_pass,
         }
@@ -261,20 +304,19 @@ impl ClientHandler {
             Address::DomainName(domain, port) => {
                 tracing::debug!(?domain, ?port, "resolving domain");
                 let ips = self.resolver.lookup_ip(domain).await?;
-                let ip = match ips.iter().next() {
-                    Some(ip) => ip,
-                    None => {
-                        let (reply_buf, reply_buf_len) =
-                            Socks5Reply::new(0x04, SocketAddr::from(([0, 0, 0, 0], 0))).to_bytes();
-                        self.stream.write_all(&reply_buf[..reply_buf_len]).await?;
-                        return Err(Error::NoSuchHost);
-                    }
+
+                let Some(ip) = ips.iter().next() else {
+                    let (reply_buf, reply_buf_len) =
+                        Reply::new(0x04, SocketAddr::from(([0, 0, 0, 0], 0))).to_bytes();
+                    self.stream.write_all(&reply_buf[..reply_buf_len]).await?;
+                    return Err(Error::NoSuchHost);
                 };
+
                 SocketAddr::from((ip, port))
             }
         };
 
-        match command.command {
+        match command.ty {
             CommandType::Connect => {
                 self.handle_connect(dest_sock_addr).await?;
             }
@@ -289,21 +331,34 @@ impl ClientHandler {
         Ok(())
     }
 
+    /// ```text
+    /// CONNECT
+    /// In the reply to a CONNECT, BND.PORT contains the port number that the
+    /// server assigned to connect to the target host, while BND.ADDR
+    /// contains the associated IP address.  The supplied BND.ADDR is often
+    /// different from the IP address that the client uses to reach the SOCKS
+    /// server, since such servers are often multi-homed.  It is expected
+    /// that the SOCKS server will use DST.ADDR and DST.PORT, and the
+    /// client-side source address and port in evaluating the CONNECT
+    /// request.
+    /// ```
     async fn handle_connect(&mut self, dest_sock_addr: SocketAddr) -> Result<(), Error> {
         let dest_stream =
             tokio::time::timeout(self.timeout, TcpStream::connect(dest_sock_addr)).await??;
 
+        // 0x00 reply means success
+        // 0.0.0.0:0 means the same address and port
         let (reply_buf, reply_buf_len) =
-            Socks5Reply::new(0x00, SocketAddr::from(([0, 0, 0, 0], 0))).to_bytes();
+            Reply::new(0x00, SocketAddr::from(([0, 0, 0, 0], 0))).to_bytes();
 
         self.stream.write_all(&reply_buf[..reply_buf_len]).await?;
 
-        self.pipe(dest_stream).await?;
+        self.pipe_tcp(dest_stream).await?;
 
         Ok(())
     }
 
-    async fn pipe(&mut self, mut dest_stream: TcpStream) -> Result<(), Error> {
+    async fn pipe_tcp(&mut self, mut dest_stream: TcpStream) -> Result<(), Error> {
         tokio::io::copy_bidirectional(&mut self.stream, &mut dest_stream).await?;
         Ok(())
     }
@@ -329,13 +384,10 @@ impl ClientHandler {
             let input = Input::from(&self.buf[..input]);
             let (username, password) = Self::parse_username_password_request(input)?;
 
-            let status = if username == user_pass.username.as_bytes()
-                || password == user_pass.password.as_bytes()
-            {
-                0x00
-            } else {
-                0x01
-            };
+            let status = u8::from(
+                !(username == user_pass.username.as_bytes()
+                    || password == user_pass.password.as_bytes()),
+            );
 
             self.stream
                 .write_all(&[USERNAME_PASSWORD_VERSION, status])
@@ -356,7 +408,7 @@ impl ClientHandler {
     ) -> Result<Command<'domain>, Error> {
         input.read_all(Error::IncompleteRead, |reader| {
             let version = reader.read_byte()?;
-            let command =
+            let ty =
                 CommandType::from_repr(reader.read_byte()?).ok_or(Error::InvalidCommandType)?;
             let _reserved = reader.read_byte()?;
             let address_type =
@@ -400,21 +452,17 @@ impl ClientHandler {
                 }
             };
 
-            Ok(Command {
-                version,
-                command,
-                addr,
-            })
+            Ok(Command { addr, ty, version })
         })
     }
 
     fn parse_username_password_request(input: Input<'_>) -> Result<(&[u8], &[u8]), Error> {
         input.read_all(Error::IncompleteRead, |reader| {
             let version = reader.read_byte()?;
-            let ulen = reader.read_byte()?;
-            let username = reader.read_bytes(ulen as usize)?;
-            let plen = reader.read_byte()?;
-            let password = reader.read_bytes(plen as usize)?;
+            let uname_len = reader.read_byte()?;
+            let username = reader.read_bytes(uname_len as usize)?;
+            let pass_len = reader.read_byte()?;
+            let password = reader.read_bytes(pass_len as usize)?;
 
             if version != USERNAME_PASSWORD_VERSION {
                 return Err(Error::InvalidVersion);
@@ -427,8 +475,8 @@ impl ClientHandler {
     fn parse_initial_packet(input: Input<'_>, use_auth: bool) -> Result<AuthMethod, Error> {
         input.read_all(Error::IncompleteRead, |reader| {
             let version = reader.read_byte()?;
-            let nmethods = reader.read_byte()?;
-            let methods = reader.read_bytes(nmethods as usize)?;
+            let num_methods = reader.read_byte()?;
+            let methods = reader.read_bytes(num_methods as usize)?;
 
             if version != SOCKS_VERSION {
                 return Err(Error::InvalidVersion);
