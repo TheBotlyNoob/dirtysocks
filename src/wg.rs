@@ -1,12 +1,16 @@
 use boringtun::noise::{errors::WireGuardError, Tunn, TunnResult};
-use smoltcp::wire::TcpPacket;
+use deadqueue::unlimited::Queue;
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use std::{
-    collections::HashMap,
     convert::Infallible,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, MutexGuard, PoisonError,
+    },
     time::Duration,
 };
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::net::UdpSocket;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -16,6 +20,8 @@ pub enum Error {
     ParsePacket(#[from] smoltcp::wire::Error),
     #[error("wireguard error: {0:#?}")]
     WireGuard(WireGuardError),
+    #[error("mutex poisoned")]
+    MutexPoisoned,
 }
 // thiserror doesn't like WireGuardError for some reason
 // so I have to implement From myself
@@ -24,121 +30,195 @@ impl From<WireGuardError> for Error {
         Self::WireGuard(e)
     }
 }
+impl<'a, T> From<PoisonError<MutexGuard<'a, T>>> for Error {
+    fn from(_: PoisonError<MutexGuard<'a, T>>) -> Self {
+        Self::MutexPoisoned
+    }
+}
 
-/// When a packet is recieved from the wireguard peer and sent to the client.
+#[derive(Debug)]
+struct InnerPacketIoQueues {
+    rx_reserved: AtomicUsize,
+    rx_queue: Queue<Vec<u8>>,
+    tx_queue: Queue<Vec<u8>>,
+}
 #[derive(Clone, Debug)]
-pub struct PacketToClient(pub Vec<u8>);
-/// When a packet is recieved from a client and sent to the wireguard peer.
-#[derive(Clone, Debug)]
-pub struct PacketToPeer(pub Vec<u8>);
+pub struct PacketIoQueues(Arc<InnerPacketIoQueues>);
 
 pub struct Peer {
-    tunn: Tunn,
+    pub tunn: Tunn,
     pub addr: SocketAddr,
     pub conn: UdpSocket,
-    pub on_packet: mpsc::Receiver<PacketToPeer>,
-    pub buf: [u8; 1024],
-    pub clients: HashMap<SocketAddr, mpsc::Sender<PacketToClient>>,
+
+    pub queues: PacketIoQueues,
 }
 
 impl Peer {
-    pub fn new(
-        tunn: Tunn,
-        addr: SocketAddr,
-        conn: UdpSocket,
-        on_packet: mpsc::Receiver<PacketToPeer>,
-    ) -> Self {
+    pub fn new(tunn: Tunn, addr: SocketAddr, conn: UdpSocket) -> Self {
         Self {
             tunn,
             addr,
             conn,
-            on_packet,
-            buf: [0; 1024],
-            clients: HashMap::new(),
+
+            queues: PacketIoQueues(Arc::new(InnerPacketIoQueues {
+                rx_reserved: AtomicUsize::new(0),
+                rx_queue: Queue::new(),
+                tx_queue: Queue::new(),
+            })),
         }
     }
 
-    pub async fn listen_for_packets(&mut self) -> Result<Infallible, Error> {
+    pub async fn begin_device(&mut self) -> Result<Infallible, Error> {
+        let mut rx_buf = [0; 8 * 1024];
+
         loop {
             tokio::select! {
-                Some(packet) = self.on_packet.recv() => self.handle_packet(packet).await?,
-                () = tokio::time::sleep(Duration::from_secs(1)) => self.update_timers().await?,
+                packet = self.queues.0.tx_queue.pop() => {
+                    self.handle_tx_packet(&packet).await.unwrap();
+                }
+                read = self.conn.recv(&mut rx_buf) => {
+                    let read = read?;
+                    self.handle_rx_packet(&rx_buf[0..read]).await.unwrap();
+                }
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    self.update_timers(&mut [0; 148]).await.unwrap();
+                }
             }
         }
     }
 
-    pub async fn handle_packet(&mut self, packet: PacketToPeer) -> Result<(), Error> {
-        let mut out = Vec::with_capacity(if packet.0.len() + 32 < 148 {
-            148
-        } else {
-            packet.0.len() + 32
-        });
+    pub async fn handle_tx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
+        let mut out = vec![0; (packet.len() + 32).max(148)];
 
-        let res = self.tunn.encapsulate(&packet.0, &mut out);
-        Self::handle_tunnresult(&mut self.conn, &self.clients, res).await?;
+        let res = self.tunn.encapsulate(packet, &mut out);
+        self.handle_tunnresult(res).await?;
 
         Ok(())
     }
 
-    pub fn add_client_addr(&mut self, addr: SocketAddr, sender: mpsc::Sender<PacketToClient>) {
-        self.clients.insert(addr, sender);
+    pub async fn handle_rx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
+        let mut out = vec![0; 8 * 1024];
+
+        let mut result: TunnResult;
+        loop {
+            result = self.tunn.decapsulate(None, packet, &mut out);
+
+            tracing::warn!(?result);
+
+            match result {
+                TunnResult::WriteToNetwork(packet) => {
+                    tracing::debug!(num_bytes = packet.len(), "writing to peer network");
+
+                    dbg!(self.conn.send(packet).await?);
+                    dbg!(packet.len());
+                }
+
+                TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    tracing::info!("WRITE TO TUNNEL");
+                    self.queues.0.rx_queue.push(packet.to_vec());
+                    break;
+                }
+
+                TunnResult::Done => break,
+                TunnResult::Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(())
     }
 
     /// Must be called often.
-    pub async fn update_timers(&mut self) -> Result<(), Error> {
+    pub async fn update_timers(&mut self, buf: &mut [u8]) -> Result<(), Error> {
         tracing::debug!("updating timers...");
 
-        let res = self.tunn.update_timers(&mut self.buf);
-        Self::handle_tunnresult(&mut self.conn, &self.clients, res).await?;
+        let res = self.tunn.update_timers(buf);
+        self.handle_tunnresult(res).await?;
 
         Ok(())
     }
 
-    async fn handle_tunnresult(
-        conn: &mut UdpSocket,
-        clients: &HashMap<SocketAddr, mpsc::Sender<PacketToClient>>,
-        val: TunnResult<'_>,
-    ) -> Result<(), Error> {
+    async fn handle_tunnresult(&self, val: TunnResult<'_>) -> Result<(), Error> {
         match val {
             // send to CF Warp
             TunnResult::WriteToNetwork(packet) => {
                 tracing::debug!(num_bytes = packet.len(), "writing to peer network");
 
-                conn.send(packet).await?;
+                self.conn.send(packet).await?;
                 Ok(())
             }
             // send to clients
-            TunnResult::WriteToTunnelV4(packet, addr) => {
-                Self::handle_wg_packet(packet, IpAddr::from(addr), clients).await
-            }
-            TunnResult::WriteToTunnelV6(packet, addr) => {
-                Self::handle_wg_packet(packet, IpAddr::from(addr), clients).await
+            TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                tracing::info!("WRITE TO TUNNEL");
+                self.queues.0.rx_queue.push(packet.to_vec());
+                Ok(())
             }
             // done
             TunnResult::Done => Ok(()),
             TunnResult::Err(e) => Err(e.into()),
         }
     }
+}
 
-    async fn handle_wg_packet(
-        packet: &[u8],
-        ip: IpAddr,
-        clients: &HashMap<SocketAddr, mpsc::Sender<PacketToClient>>,
-    ) -> Result<(), Error> {
-        let packet = TcpPacket::new_checked(packet)?;
-        let port = packet.dst_port();
+pub struct WgDevice(pub PacketIoQueues);
 
-        let sock_addr = SocketAddr::from((ip, port));
+pub struct WgRxToken<'a>(&'a Queue<Vec<u8>>);
+impl<'a> RxToken for WgRxToken<'a> {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut packet = self.0.try_pop().unwrap();
+        tracing::debug!(packet_size = packet.len(), "recv token consumed");
+        f(&mut packet)
+    }
+}
 
-        tracing::info!(dest_addr = ?ip, "sending packet to client...");
+pub struct WgTxToken<'a>(&'a Queue<Vec<u8>>);
+impl<'a> TxToken for WgTxToken<'a> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        tracing::debug!(?len, "transfer token consumed");
+        let mut packet = vec![0; len];
 
-        clients
-            .get(&sock_addr)
-            .unwrap()
-            .send(PacketToClient(packet.into_inner().to_vec()))
-            .await
-            .unwrap();
+        let ret = f(&mut packet);
 
-        Ok(())
+        self.0.push(packet);
+
+        ret
+    }
+}
+
+impl Device for WgDevice {
+    type RxToken<'a> = WgRxToken<'a>;
+    type TxToken<'a> = WgTxToken<'a>;
+
+    fn receive(
+        &mut self,
+        _timestamp: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // TODO: I hate atomics. Nonetheless, I need to figure out if this is the right ordering.
+        if self.0 .0.rx_reserved.load(Ordering::SeqCst) >= self.0 .0.rx_queue.len() {
+            None
+        } else {
+            self.0 .0.rx_reserved.fetch_add(1, Ordering::SeqCst);
+
+            Some((
+                WgRxToken(&self.0 .0.rx_queue),
+                WgTxToken(&self.0 .0.tx_queue),
+            ))
+        }
+    }
+
+    fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        Some(WgTxToken(&self.0 .0.tx_queue))
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut capabilities = DeviceCapabilities::default();
+        capabilities.medium = Medium::Ip;
+        capabilities.max_transmission_unit = 1500;
+        capabilities
     }
 }
