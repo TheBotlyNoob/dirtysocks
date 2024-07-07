@@ -135,7 +135,9 @@ impl Server {
                     poll_next = self.poll_iface(),
                 Some(pipe) = piping.next() => {
                     let (sent_len, pipe) = pipe?;
-                    piping.push(self.pipe(sent_len, pipe));
+                    if let Some(pipe) = self.pipe(sent_len, pipe) {
+                        piping.push(pipe);
+                    }
                 }
                 Some(conn) = connections_authorized.next() => {
                     let (addr, conn) = conn?;
@@ -206,7 +208,7 @@ impl Server {
         &mut self,
         sent_len: usize,
         pipe: Connection<Piping>,
-    ) -> Pin<Box<dyn Future<Output = Result<(usize, Connection<Piping>), Error>> + Send + Sync>>
+    ) -> Option<Pin<Box<dyn Future<Output = Result<(usize, Connection<Piping>), Error>> + Send + Sync>>>
     {
         let socket = self.socket_set.get_mut::<tcp::Socket>(pipe.socket_handle);
 
@@ -214,10 +216,11 @@ impl Server {
 
         if socket.can_send() {
             tracing::info!(?sent_len, "sending through wireguard");
-            assert_eq!(socket.send_slice(&pipe.buf[0..sent_len]).unwrap(), sent_len);
-            Box::pin(pipe.pipe(None))
+            //assert_eq!(socket.send_slice(&pipe.buf[0..sent_len]).unwrap(), sent_len);
+            // Box::pin(pipe.pipe(None))
+            None
         } else {
-            Box::pin(async move { Ok((sent_len, pipe)) })
+            Some(Box::pin(async move { Ok((sent_len, pipe)) }))
         }
     }
 
