@@ -68,6 +68,7 @@ pub struct Server {
     pub resolver: TokioAsyncResolver,
     pub timeout: Duration,
     pub user_pass: Option<UserPass>,
+    next_ephemeral_port: u16,
 }
 
 type FoConn<T> = FuturesUnordered<Pin<Box<dyn Future<Output = Result<T, Error>> + Send>>>;
@@ -107,6 +108,7 @@ impl Server {
             resolver,
             timeout,
             user_pass,
+            next_ephemeral_port: 1,
         })
     }
 
@@ -202,9 +204,11 @@ impl Server {
             .connect(
                 self.iface.context(),
                 (IpAddress::from(addr.ip()), addr.port()),
-                49154,
+                self.next_ephemeral_port,
             )
             .unwrap();
+
+        self.next_ephemeral_port += 1;
 
         conn.pipe(None)
     }
@@ -225,12 +229,7 @@ impl Server {
             sent_len = 0;
         }
 
-        if socket.may_recv() {
-            tracing::error!("{}", socket.can_recv());
-        }
-
         if socket.can_recv() {
-            panic!();
             tracing::info!("attempting to recv");
             Box::pin(
                 socket
@@ -249,11 +248,15 @@ impl Server {
     }
 
     fn poll_iface(&mut self) -> tokio::time::Instant {
+        let std_now = std::time::Instant::now();
+        let smoltcp_now = smoltcp::time::Instant::from(std_now);
+        let tokio_now = tokio::time::Instant::from_std(std_now);
+
         self.iface
-            .poll(Instant::now(), &mut self.device, &mut self.socket_set);
+            .poll(smoltcp_now, &mut self.device, &mut self.socket_set);
 
-        let delay = self.iface.poll_delay(Instant::now(), &self.socket_set);
+        let delay = self.iface.poll_delay(smoltcp_now, &self.socket_set);
 
-        tokio::time::Instant::now() + Duration::from_micros(delay.map_or(0, |d| d.total_micros()))
+        tokio_now + Duration::from_micros(delay.map_or(0, |d| d.total_micros()))
     }
 }

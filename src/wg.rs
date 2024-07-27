@@ -1,6 +1,9 @@
 use boringtun::noise::{errors::WireGuardError, Tunn, TunnResult};
 use deadqueue::unlimited::Queue;
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::{
+    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    wire::{Ipv4Packet, PrettyPrinter},
+};
 use std::{
     convert::Infallible,
     net::SocketAddr,
@@ -167,14 +170,23 @@ impl Peer {
 
 pub struct WgDevice(pub PacketIoQueues);
 
-pub struct WgRxToken<'a>(&'a Queue<Vec<u8>>);
+pub struct WgRxToken<'a>(&'a Queue<Vec<u8>>, &'a AtomicUsize);
 impl<'a> RxToken for WgRxToken<'a> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
         let mut packet = self.0.try_pop().unwrap();
-        tracing::debug!(packet_size = packet.len(), "recv token consumed");
+        self.1.fetch_sub(1, Ordering::SeqCst);
+
+        match Ipv4Packet::new_checked(&*packet) {
+            Ok(parsed) => {
+                tracing::info!(info = %PrettyPrinter::<Ipv4Packet<&[u8]>>::print(&parsed));
+                tracing::info!(body = %String::from_utf8_lossy(parsed.payload()));
+            }
+            Err(e) => tracing::warn!(?e, "failed parsing packet"),
+        }
+
         f(&mut packet)
     }
 }
@@ -211,7 +223,7 @@ impl Device for WgDevice {
             self.0 .0.rx_reserved.fetch_add(1, Ordering::SeqCst);
 
             Some((
-                WgRxToken(&self.0 .0.rx_queue),
+                WgRxToken(&self.0 .0.rx_queue, &self.0 .0.rx_reserved),
                 WgTxToken(&self.0 .0.tx_queue),
             ))
         }
