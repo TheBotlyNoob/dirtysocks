@@ -97,11 +97,18 @@ impl Peer {
     }
 
     pub async fn handle_rx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
+        tracing::info!(len = packet.len(), "recieved packet");
+
         let mut out = vec![0; 8 * 1024];
 
         let mut result: TunnResult;
+        let mut first_loop = true;
         loop {
-            result = self.tunn.decapsulate(None, packet, &mut out);
+            result = self
+                .tunn
+                .decapsulate(None, if first_loop { packet } else { &[] }, &mut out);
+
+            first_loop = false;
 
             tracing::warn!(?result);
 
@@ -109,8 +116,7 @@ impl Peer {
                 TunnResult::WriteToNetwork(packet) => {
                     tracing::debug!(num_bytes = packet.len(), "writing to peer network");
 
-                    dbg!(self.conn.send(packet).await?);
-                    dbg!(packet.len());
+                    self.conn.send(packet).await?;
                 }
 
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {

@@ -391,6 +391,7 @@ impl Connection<Piping> {
     pub async fn pipe(mut self, resp_len: Option<usize>) -> Result<(usize, Self), Error> {
         tracing::info!(?resp_len, "piping");
         if let Some(resp_len) = resp_len {
+            tracing::info!(?resp_len, "recv'd");
             self.stream.write_all(&self.buf[0..resp_len]).await?;
         }
 

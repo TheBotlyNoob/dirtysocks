@@ -11,7 +11,7 @@ use smoltcp::{
     time::Instant,
     wire::{HardwareAddress, IpAddress, IpCidr},
 };
-use std::{convert::Infallible, net::SocketAddr, pin::Pin, time::Duration};
+use std::{convert::Infallible, io::ErrorKind, net::SocketAddr, pin::Pin, time::Duration};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 pub mod wg;
@@ -76,15 +76,15 @@ impl Server {
     pub async fn new(
         listener: TcpListener,
         tunn: Tunn,
-        wg_addr: SocketAddr,
+        endpoint_addr: SocketAddr,
         resolver: TokioAsyncResolver,
         timeout: Duration,
         user_pass: Option<UserPass>,
     ) -> Result<Self, Error> {
         let peer_conn = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
-        peer_conn.connect(wg_addr).await?;
+        peer_conn.connect(endpoint_addr).await?;
 
-        let peer = Peer::new(tunn, wg_addr, peer_conn);
+        let peer = Peer::new(tunn, endpoint_addr, peer_conn);
         let mut device = WgDevice(peer.queues.clone());
 
         let mut iface_conf = Config::new(HardwareAddress::Ip);
@@ -94,7 +94,7 @@ impl Server {
 
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs
-                .push(IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24))
+                .push(IpCidr::new(IpAddress::v4(172, 16, 0, 2), 32))
                 .unwrap();
         });
 
@@ -134,9 +134,14 @@ impl Server {
                 () = tokio::time::sleep_until(poll_next) =>
                     poll_next = self.poll_iface(),
                 Some(pipe) = piping.next() => {
-                    let (sent_len, pipe) = pipe?;
-                    if let Some(pipe) = self.pipe(sent_len, pipe) {
-                        piping.push(pipe);
+                    match pipe {
+                        Ok((sent_len, pipe)) => piping.push(self.pipe(sent_len, pipe)),
+                        Err(Error::Io(e)) if e.kind() == ErrorKind::ConnectionReset => {
+                            tracing::warn!(?e, "errord. probably just closed tho.");
+                        },
+                        Err(e) => {
+                            tracing::error!(?e, "unexpected error while piping");
+                        }
                     }
                 }
                 Some(conn) = connections_authorized.next() => {
@@ -167,8 +172,8 @@ impl Server {
         tracing::info!(?client_addr, "new connection");
 
         let socket = tcp::Socket::new(
-            SocketBuffer::new(Vec::with_capacity(8 * 1024)),
-            SocketBuffer::new(Vec::with_capacity(8 * 1024)),
+            SocketBuffer::new(vec![0; 8 * 1024]),
+            SocketBuffer::new(vec![0; 8 * 1024]),
         );
 
         let socket_handle = self.socket_set.add(socket);
@@ -206,21 +211,40 @@ impl Server {
 
     fn pipe(
         &mut self,
-        sent_len: usize,
-        pipe: Connection<Piping>,
-    ) -> Option<Pin<Box<dyn Future<Output = Result<(usize, Connection<Piping>), Error>> + Send + Sync>>>
+        mut sent_len: usize,
+        mut pipe: Connection<Piping>,
+    ) -> Pin<Box<dyn Future<Output = Result<(usize, Connection<Piping>), Error>> + Send + Sync>>
     {
         let socket = self.socket_set.get_mut::<tcp::Socket>(pipe.socket_handle);
 
-        //tracing::debug!(?sent_len, can_send = socket.can_send(), "");
-
-        if socket.can_send() {
+        if sent_len > 0 && socket.may_send() {
             tracing::info!(?sent_len, "sending through wireguard");
-            //assert_eq!(socket.send_slice(&pipe.buf[0..sent_len]).unwrap(), sent_len);
-            // Box::pin(pipe.pipe(None))
-            None
+            assert_eq!(socket.send_slice(&pipe.buf[0..sent_len]).unwrap(), sent_len);
+
+            // show that its been sent
+            sent_len = 0;
+        }
+
+        if socket.may_recv() {
+            tracing::error!("{}", socket.can_recv());
+        }
+
+        if socket.can_recv() {
+            panic!();
+            tracing::info!("attempting to recv");
+            Box::pin(
+                socket
+                    .recv(|buf| {
+                        tracing::error!(len = buf.len(), "recv'd");
+                        pipe.buf[0..buf.len()].copy_from_slice(buf);
+
+                        (buf.len(), pipe.pipe(Some(buf.len())))
+                    })
+                    .unwrap(),
+            )
         } else {
-            Some(Box::pin(async move { Ok((sent_len, pipe)) }))
+            // keep polling this pipe until we can read more
+            Box::pin(async move { Ok((sent_len, pipe)) })
         }
     }
 

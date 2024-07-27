@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use base64::Engine;
 use boringtun::{
@@ -16,12 +19,9 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .pretty()
-        .without_time()
-        .with_file(false)
         .with_env_filter(
             EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
+                .with_default_directive(LevelFilter::DEBUG.into())
                 .from_env_lossy(),
         )
         .init();
@@ -29,7 +29,7 @@ async fn main() {
     let mut private_key = [0; 32];
     base64::engine::general_purpose::STANDARD
         .decode_slice(
-            "UF/5fKy4UySpMvSrXks0uMwOCDxCoKj0RpD8g0l3V2M=",
+            "CAgukgSnXSV/Bf6pubM/GdW1QZ/bmjBbsI2LryTJwk4=",
             &mut private_key,
         )
         .unwrap();
@@ -47,12 +47,12 @@ async fn main() {
             StaticSecret::from(private_key),
             PublicKey::from(public_key),
             None,
-            None,
+            Some(30),
             0,
             None,
         )
         .unwrap(),
-        SocketAddr::from(([162, 159, 193, 1], 0)),
+        SocketAddr::from((Ipv4Addr::from([162, 159, 192, 1]), 2408)),
         TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default()),
         Duration::from_secs(20),
         None,
@@ -60,5 +60,6 @@ async fn main() {
     .await
     .unwrap()
     .listen()
-    .await;
+    .await
+    .unwrap();
 }
