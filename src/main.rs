@@ -1,5 +1,5 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
@@ -56,6 +56,7 @@ async fn main() {
         TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default()),
         Duration::from_secs(20),
         None,
+        IpAddr::V4(Ipv4Addr::new(172, 16, 0, 2)),
     )
     .await
     .unwrap()

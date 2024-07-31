@@ -113,8 +113,6 @@ impl Peer {
 
             first_loop = false;
 
-            tracing::warn!(?result);
-
             match result {
                 TunnResult::WriteToNetwork(packet) => {
                     tracing::debug!(num_bytes = packet.len(), "writing to peer network");
@@ -182,7 +180,6 @@ impl<'a> RxToken for WgRxToken<'a> {
         match Ipv4Packet::new_checked(&*packet) {
             Ok(parsed) => {
                 tracing::info!(info = %PrettyPrinter::<Ipv4Packet<&[u8]>>::print(&parsed));
-                tracing::info!(body = %String::from_utf8_lossy(parsed.payload()));
             }
             Err(e) => tracing::warn!(?e, "failed parsing packet"),
         }

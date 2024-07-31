@@ -8,6 +8,7 @@ tokio = { version = "1.35.1", default-features = false, features = [
     "net",
     "macros",
     "sync",
+    "rt-multi-thread",
 ] }
 hickory-resolver = "0.24.1"
 strum = { version = "0.26.2", features = ["derive"] }

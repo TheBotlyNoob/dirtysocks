@@ -7,11 +7,20 @@ use handler::{Authorized, Connection, Initial, Piping};
 use hickory_resolver::TokioAsyncResolver;
 use smoltcp::{
     iface::{self, Config, SocketSet},
-    socket::tcp::{self, SocketBuffer},
+    socket::{
+        tcp::{self, SocketBuffer},
+        AnySocket, Socket,
+    },
     time::Instant,
     wire::{HardwareAddress, IpAddress, IpCidr},
 };
-use std::{convert::Infallible, io::ErrorKind, net::SocketAddr, pin::Pin, time::Duration};
+use std::{
+    convert::Infallible,
+    io::ErrorKind,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    time::Duration,
+};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 pub mod wg;
@@ -74,6 +83,7 @@ pub struct Server {
 type FoConn<T> = FuturesUnordered<Pin<Box<dyn Future<Output = Result<T, Error>> + Send>>>;
 
 impl Server {
+    // TODO: use builder for this
     pub async fn new(
         listener: TcpListener,
         tunn: Tunn,
@@ -81,6 +91,7 @@ impl Server {
         resolver: TokioAsyncResolver,
         timeout: Duration,
         user_pass: Option<UserPass>,
+        iface_addr: IpAddr,
     ) -> Result<Self, Error> {
         let peer_conn = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
         peer_conn.connect(endpoint_addr).await?;
@@ -95,7 +106,7 @@ impl Server {
 
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs
-                .push(IpCidr::new(IpAddress::v4(172, 16, 0, 2), 32))
+                .push(IpCidr::new(IpAddress::from(iface_addr), 32))
                 .unwrap();
         });
 
@@ -129,39 +140,50 @@ impl Server {
         let mut initial_connections: FoConn<Connection<Authorized>> = FuturesUnordered::new();
         let mut connections_authorized: FoConn<(SocketAddr, Connection<Piping>)> =
             FuturesUnordered::new();
-        let mut piping: FoConn<(usize, Connection<Piping>)> = FuturesUnordered::new();
+        let mut piping: FoConn<(Option<usize>, Connection<Piping>)> = FuturesUnordered::new();
 
         loop {
             tokio::select! {
+                biased;
+
+                Ok((stream, client_addr)) = {async {let res = self.listener.accept().await; tracing::info!(?res); res} } =>
+                    initial_connections.push(Box::pin(self.new_conn(
+                        stream,
+                        client_addr,
+                    ))),
                 () = tokio::time::sleep_until(poll_next) =>
-                    poll_next = self.poll_iface(),
+                    {
+                        poll_next = self.poll_iface();
+                        tracing::warn!(init_conn_len = initial_connections.len(), conn_authed = connections_authorized.len(), piping = piping.len());
+                    }
                 Some(pipe) = piping.next() => {
-                    match pipe {
-                        Ok((sent_len, pipe)) => piping.push(self.pipe(sent_len, pipe)),
-                        Err(Error::Io(e)) if e.kind() == ErrorKind::ConnectionReset => {
-                            tracing::warn!(?e, "errord. probably just closed tho.");
-                        },
+                    let (sent_len, pipe) = match pipe {
+                        Ok(p) => p,
                         Err(e) => {
-                            tracing::error!(?e, "unexpected error while piping");
+                            tracing::warn!(?e, "error piping");
+                            continue;
                         }
+                    };
+
+                    if sent_len == Some(0) {
+                        // the connection has been closed
+                        tcp::Socket::downcast_mut(&mut self.socket_set.remove(pipe.socket_handle)).unwrap().close();
+                    } else {
+                        piping.push(self.pipe(sent_len, pipe));
                     }
                 }
                 Some(conn) = connections_authorized.next() => {
-                    let (addr, conn) = conn?;
+                    let (addr, conn) = conn.unwrap();
                     piping.push(Box::pin(self.conn_authorized(
                         addr,
                         conn,
                     )));
                 }
                 Some(conn) = initial_connections.next() => {
-                    let conn = conn?;
+                    let conn = conn.unwrap();
                     connections_authorized.push(Box::pin(conn.handle_request()));
                 }
-                Ok((stream, client_addr)) = self.listener.accept() =>
-                    initial_connections.push(Box::pin(self.new_conn(
-                        stream,
-                        client_addr,
-                    ))),
+
             }
         }
     }
@@ -195,7 +217,7 @@ impl Server {
         &mut self,
         addr: SocketAddr,
         conn: Connection<Piping>,
-    ) -> impl Future<Output = Result<(usize, Connection<Piping>), Error>> {
+    ) -> impl Future<Output = Result<(Option<usize>, Connection<Piping>), Error>> {
         tracing::info!(?addr, "connection authorized");
 
         let socket = self.socket_set.get_mut::<tcp::Socket>(conn.socket_handle);
@@ -215,18 +237,22 @@ impl Server {
 
     fn pipe(
         &mut self,
-        mut sent_len: usize,
+        mut sent_len: Option<usize>,
         mut pipe: Connection<Piping>,
-    ) -> Pin<Box<dyn Future<Output = Result<(usize, Connection<Piping>), Error>> + Send + Sync>>
-    {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(Option<usize>, Connection<Piping>), Error>> + Send + Sync>,
+    > {
         let socket = self.socket_set.get_mut::<tcp::Socket>(pipe.socket_handle);
 
-        if sent_len > 0 && socket.may_send() {
-            tracing::info!(?sent_len, "sending through wireguard");
-            assert_eq!(socket.send_slice(&pipe.buf[0..sent_len]).unwrap(), sent_len);
-
-            // show that its been sent
-            sent_len = 0;
+        if let Some(sent_len_) = sent_len {
+            if socket.may_send() {
+                tracing::info!(?sent_len, "sending through wireguard");
+                assert_eq!(
+                    socket.send_slice(&pipe.buf[0..sent_len_]).unwrap(),
+                    sent_len_
+                );
+                sent_len = None;
+            }
         }
 
         if socket.can_recv() {
@@ -243,7 +269,10 @@ impl Server {
             )
         } else {
             // keep polling this pipe until we can read more
-            Box::pin(async move { Ok((sent_len, pipe)) })
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok((sent_len, pipe))
+            })
         }
     }
 

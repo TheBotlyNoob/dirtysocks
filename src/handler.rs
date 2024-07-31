@@ -151,7 +151,7 @@ pub struct Connection<State> {
     pub buf: [u8; 8 * 1024],
     user_pass: Option<crate::UserPass>,
 
-    state: State,
+    _state: PhantomData<State>,
 }
 impl Connection<Initial> {
     pub fn new(
@@ -170,7 +170,7 @@ impl Connection<Initial> {
             timeout,
             buf: [0; 8 * 1024],
             user_pass,
-            state: Initial,
+            _state: PhantomData,
         }
     }
 
@@ -210,7 +210,7 @@ impl Connection<Initial> {
             }
         }
 
-        Ok(change_state(self, Authorized))
+        Ok(change_state::<_, Authorized>(self))
     }
 
     fn parse_username_password_request(input: Input<'_>) -> Result<(&[u8], &[u8]), Error> {
@@ -329,7 +329,7 @@ impl Connection<Authorized> {
 
         self.stream.write_all(&reply_buf[..reply_buf_len]).await?;
 
-        Ok(change_state(self, Piping))
+        Ok(change_state::<_, Piping>(self))
     }
 
     fn parse_request<'domain>(
@@ -388,20 +388,19 @@ impl Connection<Authorized> {
 }
 
 impl Connection<Piping> {
-    pub async fn pipe(mut self, resp_len: Option<usize>) -> Result<(usize, Self), Error> {
+    pub async fn pipe(mut self, resp_len: Option<usize>) -> Result<(Option<usize>, Self), Error> {
         tracing::info!(?resp_len, "piping");
         if let Some(resp_len) = resp_len {
-            tracing::info!(?resp_len, "recv'd");
             self.stream.write_all(&self.buf[0..resp_len]).await?;
         }
 
         let read = self.stream.read(&mut self.buf).await?;
 
-        Ok((read, self))
+        Ok((Some(read), self))
     }
 }
 
-fn change_state<O, N>(old: Connection<O>, new_state: N) -> Connection<N> {
+fn change_state<O, N>(old: Connection<O>) -> Connection<N> {
     Connection {
         stream: old.stream,
         client_addr: old.client_addr,
@@ -410,6 +409,6 @@ fn change_state<O, N>(old: Connection<O>, new_state: N) -> Connection<N> {
         timeout: old.timeout,
         buf: old.buf,
         user_pass: old.user_pass,
-        state: new_state,
+        _state: PhantomData,
     }
 }
