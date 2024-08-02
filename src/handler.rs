@@ -389,14 +389,15 @@ impl Connection<Authorized> {
 
 impl Connection<Piping> {
     pub async fn pipe(mut self, resp_len: Option<usize>) -> Result<(Option<usize>, Self), Error> {
-        tracing::info!(?resp_len, "piping");
         if let Some(resp_len) = resp_len {
             self.stream.write_all(&self.buf[0..resp_len]).await?;
         }
 
-        let read = self.stream.read(&mut self.buf).await?;
-
-        Ok((Some(read), self))
+        match tokio::time::timeout(Duration::from_millis(25), self.stream.read(&mut self.buf)).await
+        {
+            Ok(read) => Ok((Some(read?), self)),
+            Err(_) => Ok((None, self)),
+        }
     }
 }
 

@@ -146,16 +146,29 @@ impl Server {
             tokio::select! {
                 biased;
 
-                Ok((stream, client_addr)) = {async {let res = self.listener.accept().await; tracing::info!(?res); res} } =>
+                Ok((stream, client_addr)) = self.listener.accept() =>
                     initial_connections.push(Box::pin(self.new_conn(
                         stream,
                         client_addr,
                     ))),
+
+                Some(conn) = connections_authorized.next() => {
+                    let (addr, conn) = conn.unwrap();
+                    piping.push(Box::pin(self.conn_authorized(
+                        addr,
+                        conn,
+                    )));
+                }
+                Some(conn) = initial_connections.next() => {
+                    let conn = conn.unwrap();
+                    connections_authorized.push(Box::pin(conn.handle_request()));
+                }
+
                 () = tokio::time::sleep_until(poll_next) =>
                     {
                         poll_next = self.poll_iface();
-                        tracing::warn!(init_conn_len = initial_connections.len(), conn_authed = connections_authorized.len(), piping = piping.len());
                     }
+
                 Some(pipe) = piping.next() => {
                     let (sent_len, pipe) = match pipe {
                         Ok(p) => p,
@@ -172,18 +185,6 @@ impl Server {
                         piping.push(self.pipe(sent_len, pipe));
                     }
                 }
-                Some(conn) = connections_authorized.next() => {
-                    let (addr, conn) = conn.unwrap();
-                    piping.push(Box::pin(self.conn_authorized(
-                        addr,
-                        conn,
-                    )));
-                }
-                Some(conn) = initial_connections.next() => {
-                    let conn = conn.unwrap();
-                    connections_authorized.push(Box::pin(conn.handle_request()));
-                }
-
             }
         }
     }
@@ -267,10 +268,13 @@ impl Server {
                     })
                     .unwrap(),
             )
+        } else if sent_len.is_none() {
+            // we sent what we wanted to--no use in waiting for a response to call `pipe` again
+            Box::pin(pipe.pipe(None))
         } else {
             // keep polling this pipe until we can read more
             Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
                 Ok((sent_len, pipe))
             })
         }
