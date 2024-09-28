@@ -77,11 +77,11 @@ impl Peer {
         loop {
             tokio::select! {
                 packet = self.queues.0.tx_queue.pop() => {
-                    self.handle_tx_packet(&packet).await.unwrap();
+                    self.handle_peer_tx_packet(&packet).await.unwrap();
                 }
                 read = self.conn.recv(&mut rx_buf) => {
                     let read = read?;
-                    self.handle_rx_packet(&rx_buf[0..read]).await.unwrap();
+                    self.handle_peer_rx_packet(&rx_buf[0..read]).await.unwrap();
                 }
                 () = tokio::time::sleep(Duration::from_secs(1)) => {
                     self.update_timers(&mut [0; 148]).await.unwrap();
@@ -90,7 +90,7 @@ impl Peer {
         }
     }
 
-    pub async fn handle_tx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
+    pub async fn handle_peer_tx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
         let mut out = vec![0; (packet.len() + 32).max(148)];
 
         let res = self.tunn.encapsulate(packet, &mut out);
@@ -99,8 +99,8 @@ impl Peer {
         Ok(())
     }
 
-    pub async fn handle_rx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
-        tracing::info!(len = packet.len(), "recieved packet");
+    pub async fn handle_peer_rx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
+        tracing::info!(len = packet.len(), "recieved packet peer");
 
         let mut out = vec![0; 8 * 1024];
 
@@ -121,7 +121,7 @@ impl Peer {
                 }
 
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                    tracing::info!("WRITE TO TUNNEL");
+                    tracing::info!("WRITE TO SMOL DEVICE");
                     self.queues.0.rx_queue.push(packet.to_vec());
                     break;
                 }
@@ -155,7 +155,7 @@ impl Peer {
             }
             // send to clients
             TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                tracing::info!("WRITE TO TUNNEL");
+                tracing::info!("WRITE TO SMOL DEVICE");
                 self.queues.0.rx_queue.push(packet.to_vec());
                 Ok(())
             }
@@ -175,11 +175,12 @@ impl<'a> RxToken for WgRxToken<'a> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let mut packet = self.0.try_pop().unwrap();
+        tracing::info!(len = self.0.len());
         self.1.fetch_sub(1, Ordering::SeqCst);
 
         match Ipv4Packet::new_checked(&*packet) {
             Ok(parsed) => {
-                tracing::info!(info = %PrettyPrinter::<Ipv4Packet<&[u8]>>::print(&parsed));
+                tracing::info!(info = %PrettyPrinter::<Ipv4Packet<&[u8]>>::print(&parsed), "PACKET FROM PEER");
             }
             Err(e) => tracing::warn!(?e, "failed parsing packet"),
         }
@@ -213,6 +214,7 @@ impl Device for WgDevice {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        tracing::warn!("recv TOKEN");
         // TODO: I hate atomics. Nonetheless, I need to figure out if this is the right ordering.
         if self.0 .0.rx_reserved.load(Ordering::SeqCst) >= self.0 .0.rx_queue.len() {
             None
@@ -227,6 +229,7 @@ impl Device for WgDevice {
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        tracing::warn!("trans TOKEN");
         Some(WgTxToken(&self.0 .0.tx_queue))
     }
 
