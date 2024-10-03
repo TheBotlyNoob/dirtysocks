@@ -19,6 +19,10 @@ use std::{
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
     pin::Pin,
+    sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -73,15 +77,16 @@ pub struct Server {
     pub peer: Option<wg::Peer>,
     pub device: wg::WgDevice,
     pub iface: iface::Interface,
-    pub socket_set: SocketSet<'static>,
+    pub socket_set: Arc<Mutex<SocketSet<'static>>>,
     pub resolver: TokioAsyncResolver,
     pub timeout: Duration,
     pub user_pass: Option<UserPass>,
-    next_ephemeral_port: u16,
+    next_ephemeral_port: Arc<AtomicU16>,
 }
 
 type FoConn<T> = FuturesUnordered<Pin<Box<dyn Future<Output = Result<T, Error>> + Send>>>;
 
+// TODO: reuse sockets
 impl Server {
     // TODO: use builder for this
     pub async fn new(
@@ -115,11 +120,11 @@ impl Server {
             peer: Some(peer),
             device,
             iface,
-            socket_set: SocketSet::new(Vec::new()),
+            socket_set: Arc::new(Mutex::new(SocketSet::new(Vec::new()))),
             resolver,
             timeout,
             user_pass,
-            next_ephemeral_port: 1,
+            next_ephemeral_port: Arc::new(AtomicU16::new(1)),
         })
     }
 
@@ -143,6 +148,13 @@ impl Server {
         let mut piping: FoConn<(Option<usize>, Connection<Piping>)> = FuturesUnordered::new();
 
         loop {
+            if tokio::time::Instant::now()
+                .saturating_duration_since(poll_next)
+                .is_zero()
+            {
+                poll_next = self.poll_iface();
+            }
+
             tokio::select! {
                 biased;
 
@@ -164,10 +176,6 @@ impl Server {
                     connections_authorized.push(Box::pin(conn.handle_request()));
                 }
 
-                () = tokio::time::sleep_until(poll_next) =>
-                    {
-                        poll_next = self.poll_iface();
-                    }
 
                 Some(pipe) = piping.next() => {
                     let (sent_len, pipe) = match pipe {
@@ -180,7 +188,7 @@ impl Server {
 
                     if sent_len == Some(0) {
                         // the connection has been closed
-                        tcp::Socket::downcast_mut(&mut self.socket_set.remove(pipe.socket_handle)).unwrap().close();
+                        self.socket_set.lock().unwrap().get_mut::<tcp::Socket>(pipe.socket_handle).close();
                     } else {
                         piping.push(self.pipe(sent_len, pipe));
                     }
@@ -201,7 +209,7 @@ impl Server {
             SocketBuffer::new(vec![0; 8 * 1024]),
         );
 
-        let socket_handle = self.socket_set.add(socket);
+        let socket_handle = self.socket_set.lock().unwrap().add(socket);
 
         Connection::new(
             stream,
@@ -221,17 +229,19 @@ impl Server {
     ) -> impl Future<Output = Result<(Option<usize>, Connection<Piping>), Error>> {
         tracing::info!(?addr, "connection authorized");
 
-        let socket = self.socket_set.get_mut::<tcp::Socket>(conn.socket_handle);
+        {
+            let mut socket_set = self.socket_set.lock().unwrap();
 
-        socket
-            .connect(
-                self.iface.context(),
-                (IpAddress::from(addr.ip()), addr.port()),
-                self.next_ephemeral_port,
-            )
-            .unwrap();
+            let socket = socket_set.get_mut::<tcp::Socket>(conn.socket_handle);
 
-        self.next_ephemeral_port += 1;
+            socket
+                .connect(
+                    self.iface.context(),
+                    (IpAddress::from(addr.ip()), addr.port()),
+                    self.next_ephemeral_port.fetch_add(1, Ordering::SeqCst),
+                )
+                .unwrap();
+        }
 
         conn.pipe(None)
     }
@@ -243,7 +253,9 @@ impl Server {
     ) -> Pin<
         Box<dyn Future<Output = Result<(Option<usize>, Connection<Piping>), Error>> + Send + Sync>,
     > {
-        let socket = self.socket_set.get_mut::<tcp::Socket>(pipe.socket_handle);
+        let mut socket_set = self.socket_set.lock().unwrap();
+
+        let socket = socket_set.get_mut::<tcp::Socket>(pipe.socket_handle);
 
         if let Some(sent_len_) = sent_len {
             if socket.may_send() {
@@ -256,7 +268,7 @@ impl Server {
             }
         }
 
-        if socket.can_recv() {
+        if dbg!(socket.can_recv()) {
             tracing::info!("attempting to recv");
             Box::pin(
                 socket
@@ -274,6 +286,7 @@ impl Server {
         } else {
             // keep polling this pipe until we can read more
             Box::pin(async move {
+                tracing::info!("polling");
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 Ok((sent_len, pipe))
             })
@@ -285,10 +298,14 @@ impl Server {
         let smoltcp_now = smoltcp::time::Instant::from(std_now);
         let tokio_now = tokio::time::Instant::from_std(std_now);
 
-        self.iface
-            .poll(smoltcp_now, &mut self.device, &mut self.socket_set);
+        let delay = {
+            let mut socket_set = self.socket_set.lock().unwrap();
 
-        let delay = self.iface.poll_delay(smoltcp_now, &self.socket_set);
+            self.iface
+                .poll(smoltcp_now, &mut self.device, &mut socket_set);
+
+            self.iface.poll_delay(smoltcp_now, &socket_set)
+        };
 
         tokio_now + Duration::from_micros(delay.map_or(0, |d| d.total_micros()))
     }
