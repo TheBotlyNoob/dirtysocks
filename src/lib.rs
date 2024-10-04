@@ -148,12 +148,7 @@ impl Server {
         let mut piping: FoConn<(Option<usize>, Connection<Piping>)> = FuturesUnordered::new();
 
         loop {
-            if tokio::time::Instant::now()
-                .saturating_duration_since(poll_next)
-                .is_zero()
-            {
-                poll_next = self.poll_iface();
-            }
+            poll_next = self.poll_iface();
 
             tokio::select! {
                 biased;
@@ -294,6 +289,7 @@ impl Server {
     }
 
     fn poll_iface(&mut self) -> tokio::time::Instant {
+        tracing::info!("polling iface");
         let std_now = std::time::Instant::now();
         let smoltcp_now = smoltcp::time::Instant::from(std_now);
         let tokio_now = tokio::time::Instant::from_std(std_now);
