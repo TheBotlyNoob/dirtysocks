@@ -214,7 +214,6 @@ impl Device for WgDevice {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        tracing::warn!("recv TOKEN");
         // TODO: I hate atomics. Nonetheless, I need to figure out if this is the right ordering.
         if self.0 .0.rx_reserved.load(Ordering::SeqCst) >= self.0 .0.rx_queue.len() {
             None

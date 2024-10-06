@@ -1,21 +1,16 @@
 #![allow(clippy::missing_errors_doc)]
 use hickory_resolver::TokioAsyncResolver;
 use seq_macro::seq;
-use smoltcp::{
-    iface::{SocketHandle, SocketSet},
-    socket::tcp,
-};
+use smoltcp::iface::SocketHandle;
 use std::{
     marker::PhantomData,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
-    sync::Arc,
     time::Duration,
 };
 use strum::FromRepr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::Mutex,
 };
 use untrusted::Input;
 
@@ -387,17 +382,23 @@ impl Connection<Authorized> {
     }
 }
 
+pub struct SendToClient(pub usize);
+pub struct SendToServer(pub usize);
 impl Connection<Piping> {
-    pub async fn pipe(mut self, resp_len: Option<usize>) -> Result<(Option<usize>, Self), Error> {
-        if let Some(resp_len) = resp_len {
-            self.stream.write_all(&self.buf[0..resp_len]).await?;
-        }
-
-        match tokio::time::timeout(Duration::from_millis(25), self.stream.read(&mut self.buf)).await
-        {
-            Ok(read) => Ok((Some(read?), self)),
-            Err(_) => Ok((None, self)),
-        }
+    pub async fn pipe(
+        mut self,
+        resp_len: Option<SendToClient>,
+    ) -> Result<(Option<SendToServer>, Self), Error> {
+        Ok((
+            if let Some(resp_len) = resp_len {
+                self.stream.write_all(&self.buf[0..resp_len.0]).await?;
+                None
+            } else {
+                (self.stream.read(&mut self.buf).await)
+                    .map_or(None, |read| Some(SendToServer(read)))
+            },
+            self,
+        ))
     }
 }
 
