@@ -5,6 +5,7 @@ use smoltcp::iface::SocketHandle;
 use std::{
     marker::PhantomData,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
+    sync::Arc,
     time::Duration,
 };
 use strum::FromRepr;
@@ -383,22 +384,45 @@ impl Connection<Authorized> {
 }
 
 pub struct SendToClient(pub usize);
-pub struct SendToServer(pub usize);
 impl Connection<Piping> {
     pub async fn pipe(
-        mut self,
+        self: Arc<Self>,
+        mut buf: [u8; 8 * 1024],
         resp_len: Option<SendToClient>,
-    ) -> Result<(Option<SendToServer>, Self), Error> {
-        Ok((
-            if let Some(resp_len) = resp_len {
-                self.stream.write_all(&self.buf[0..resp_len.0]).await?;
-                None
-            } else {
-                (self.stream.read(&mut self.buf).await)
-                    .map_or(None, |read| Some(SendToServer(read)))
-            },
-            self,
-        ))
+    ) -> Result<([u8; 8 * 1024], Option<usize>), Error> {
+        tracing::info!("WAAAH");
+        if let Some(mut resp_len) = resp_len {
+            loop {
+                self.stream.writable().await?;
+
+                tracing::error!("abc");
+
+                match self.stream.try_write(&buf[..resp_len.0]) {
+                    Ok(n) => {
+                        break if n == resp_len.0 {
+                            Ok((buf, None))
+                        } else {
+                            buf.rotate_left(n);
+                            resp_len.0 -= n;
+
+                            Ok((buf, Some(resp_len.0)))
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) => break Err(e.into()),
+                }
+            }
+        } else {
+            loop {
+                self.stream.readable().await?;
+
+                match self.stream.try_read(&mut buf) {
+                    Ok(n) => break Ok((buf, Some(n))),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) => break Err(e.into()),
+                }
+            }
+        }
     }
 }
 

@@ -3,10 +3,10 @@
 
 use boringtun::noise::Tunn;
 use futures::{stream::FuturesUnordered, Future, StreamExt};
-use handler::{Authorized, Connection, Piping, SendToClient, SendToServer};
+use handler::{Authorized, Connection, Piping, SendToClient};
 use hickory_resolver::TokioAsyncResolver;
 use smoltcp::{
-    iface::{self, Config, SocketHandle, SocketSet},
+    iface::{self, Config, SocketSet},
     socket::tcp::{self, SocketBuffer},
     time::Instant,
     wire::{HardwareAddress, IpAddress, IpCidr},
@@ -223,10 +223,10 @@ impl Server {
                 .unwrap();
         }
 
+        let pipe = Arc::new(pipe);
         PipeFut {
-            socket_handle: pipe.socket_handle,
-            pipe: None,
-            fut: Box::pin(pipe.pipe(None)),
+            fut: Box::pin(pipe.clone().pipe([0; 8 * 1024], None)),
+            pipe,
             sending: true,
             socket_set: self.socket_set.clone(),
         }
@@ -251,13 +251,10 @@ impl Server {
 }
 
 struct PipeFut {
-    pipe: Option<Connection<Piping>>,
-    fut: Pin<
-        Box<dyn Future<Output = Result<(Option<SendToServer>, Connection<Piping>), Error>> + Send>,
-    >,
+    pipe: Arc<Connection<Piping>>,
+    fut: Pin<Box<dyn Future<Output = Result<([u8; 8 * 1024], Option<usize>), Error>> + Send>>,
     sending: bool,
     socket_set: Arc<Mutex<SocketSet<'static>>>,
-    socket_handle: SocketHandle,
 }
 
 impl Future for PipeFut {
@@ -265,16 +262,15 @@ impl Future for PipeFut {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let Self {
-            ref mut pipe,
+            ref pipe,
             ref mut fut,
-            sending,
+            ref mut sending,
             ref mut socket_set,
-            socket_handle,
         } = *self;
 
         let mut socket_set = socket_set.lock().unwrap();
 
-        let socket = socket_set.get_mut::<tcp::Socket>(socket_handle);
+        let socket = socket_set.get_mut::<tcp::Socket>(pipe.socket_handle);
 
         socket.register_recv_waker(cx.waker());
         socket.register_send_waker(cx.waker());
@@ -282,44 +278,52 @@ impl Future for PipeFut {
         let res = fut.as_mut().poll(cx);
         match res {
             Poll::Ready(to_send) => {
-                let (to_send, new_pipe) = to_send?;
+                let (buf, to_send) = to_send?;
 
-                if let Some(SendToServer(to_send)) = to_send {
-                    if to_send == 0 {
-                        tracing::info!("closing connection");
-                        return Poll::Ready(Ok(()));
-                    }
-                    if socket.may_send() {
-                        tracing::info!(?to_send, "sending through wireguard");
-                        assert_eq!(
-                            socket.send_slice(&new_pipe.buf[0..to_send]).unwrap(),
-                            to_send
-                        );
-                    }
-                }
-
-                if dbg!(socket.may_recv()) {
-                    if let Some(mut pipe) = pipe.take() {
-                        tracing::info!("attempting to recv");
-                        let new_fut = socket
-                            .recv(|buf| {
-                                tracing::error!(len = buf.len(), "recv'd");
-                                pipe.buf[0..buf.len()].copy_from_slice(buf);
-
-                                (
-                                    buf.len(),
-                                    Box::pin(pipe.pipe(Some(SendToClient(buf.len())))),
-                                )
-                            })
-                            .unwrap();
-                        *fut = new_fut;
+                if let Some(to_send) = to_send {
+                    if *sending {
+                        // this means there's still stuff left in the buffer to send
+                        *fut = Box::pin(pipe.clone().pipe(buf, Some(SendToClient(to_send))));
+                    } else {
+                        if to_send == 0 {
+                            tracing::info!("closing connection");
+                            socket.close();
+                            return Poll::Ready(Ok(()));
+                        }
+                        if socket.may_send() {
+                            tracing::info!(?to_send, "sending through wireguard");
+                            assert_eq!(socket.send_slice(&buf[0..to_send]).unwrap(), to_send);
+                        }
                     }
                 }
 
-                *fut = Box::pin(new_pipe.pipe(None));
+                *sending = false;
+                *fut = Box::pin(pipe.clone().pipe(buf, None));
             }
-            Poll::Pending if sending => return Poll::Pending,
-            Poll::Pending => {}
+            Poll::Pending if *sending => {
+                tracing::info!("waiting to send");
+                return Poll::Pending;
+            }
+            Poll::Pending => {
+                if dbg!(socket.may_recv()) {
+                    tracing::info!("attempting to recv");
+                    let new_fut = socket
+                        .recv(|buf| {
+                            tracing::error!(len = buf.len(), "recv'd");
+                            let mut new_buf = [0; 8 * 1024];
+                            let to_read = buf.len().min(new_buf.len());
+                            new_buf[0..to_read].copy_from_slice(buf);
+
+                            (
+                                to_read,
+                                Box::pin(pipe.clone().pipe(new_buf, Some(SendToClient(buf.len())))),
+                            )
+                        })
+                        .unwrap();
+                    *sending = true;
+                    *fut = new_fut;
+                }
+            }
         }
 
         tracing::error!("wowza");
