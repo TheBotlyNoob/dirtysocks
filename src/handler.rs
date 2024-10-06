@@ -150,7 +150,7 @@ pub struct Connection<State> {
     _state: PhantomData<State>,
 }
 impl Connection<Initial> {
-    pub fn new(
+    pub const fn new(
         stream: TcpStream,
         client_addr: SocketAddr,
         socket_handle: SocketHandle,
