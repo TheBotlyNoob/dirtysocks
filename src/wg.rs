@@ -13,7 +13,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::net::UdpSocket;
+use tokio::{io::BufReader, net::UdpSocket, time::Instant};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -74,8 +74,11 @@ impl Peer {
     pub async fn begin_device(&mut self) -> Result<Infallible, Error> {
         let mut rx_buf = [0; 8 * 1024];
 
+        let mut update_next = Instant::now();
         loop {
             tokio::select! {
+                biased;
+
                 packet = self.queues.0.tx_queue.pop() => {
                     self.handle_peer_tx_packet(&packet).await.unwrap();
                 }
@@ -83,7 +86,9 @@ impl Peer {
                     let read = read?;
                     self.handle_peer_rx_packet(&rx_buf[0..read]).await.unwrap();
                 }
-                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                () = tokio::time::sleep_until(update_next) => {
+                    update_next = Instant::now() + Duration::from_secs(1);
+
                     self.update_timers(&mut [0; 148]).await.unwrap();
                 }
             }

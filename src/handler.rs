@@ -141,7 +141,6 @@ pub struct Piping;
 pub struct Connection<State> {
     stream: TcpStream,
     client_addr: SocketAddr,
-    pub socket_handle: SocketHandle,
     resolver: TokioAsyncResolver,
     timeout: Duration,
     pub buf: [u8; 8 * 1024],
@@ -153,7 +152,6 @@ impl Connection<Initial> {
     pub const fn new(
         stream: TcpStream,
         client_addr: SocketAddr,
-        socket_handle: SocketHandle,
         resolver: TokioAsyncResolver,
         timeout: Duration,
         user_pass: Option<crate::UserPass>,
@@ -161,7 +159,6 @@ impl Connection<Initial> {
         Self {
             stream,
             client_addr,
-            socket_handle,
             resolver,
             timeout,
             buf: [0; 8 * 1024],
@@ -390,23 +387,20 @@ impl Connection<Piping> {
         mut buf: [u8; 8 * 1024],
         resp_len: Option<SendToClient>,
     ) -> Result<([u8; 8 * 1024], Option<usize>), Error> {
-        tracing::info!("WAAAH");
         if let Some(mut resp_len) = resp_len {
             loop {
                 self.stream.writable().await?;
 
-                tracing::error!("abc");
-
                 match self.stream.try_write(&buf[..resp_len.0]) {
                     Ok(n) => {
-                        break if n == resp_len.0 {
-                            Ok((buf, None))
-                        } else {
-                            buf.rotate_left(n);
-                            resp_len.0 -= n;
-
-                            Ok((buf, Some(resp_len.0)))
+                        if n == resp_len.0 {
+                            break Ok((buf, None));
                         }
+
+                        buf.rotate_left(n);
+                        resp_len.0 -= n;
+
+                        continue;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Err(e) => break Err(e.into()),
@@ -430,7 +424,6 @@ fn change_state<O, N>(old: Connection<O>) -> Connection<N> {
     Connection {
         stream: old.stream,
         client_addr: old.client_addr,
-        socket_handle: old.socket_handle,
         resolver: old.resolver,
         timeout: old.timeout,
         buf: old.buf,

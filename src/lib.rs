@@ -5,8 +5,11 @@ use boringtun::noise::Tunn;
 use handler::{Authorized, Connection, Piping, SendToClient};
 use hickory_resolver::TokioAsyncResolver;
 use smoltcp::{
-    iface::{self, Config, SocketSet},
-    socket::tcp::{self, SocketBuffer},
+    iface::{self, Config, SocketHandle, SocketSet},
+    socket::{
+        tcp::{self, SocketBuffer},
+        AnySocket,
+    },
     time::Instant,
     wire::{HardwareAddress, IpAddress, IpCidr},
 };
@@ -142,10 +145,12 @@ impl Server {
 
         let mut poll_next = tokio::time::Instant::now();
 
-        let mut initial_connections: JoinSet<Result<Connection<Authorized>, Error>> =
-            JoinSet::new();
-        let mut connections_authorized: JoinSet<Result<(SocketAddr, Connection<Piping>), Error>> =
-            JoinSet::new();
+        let mut initial_connections: JoinSet<
+            Result<(SocketHandle, Connection<Authorized>), Error>,
+        > = JoinSet::new();
+        let mut connections_authorized: JoinSet<
+            Result<(SocketAddr, SocketHandle, Connection<Piping>), Error>,
+        > = JoinSet::new();
         let mut piping: JoinSet<Result<(), Error>> = JoinSet::new();
 
         loop {
@@ -161,9 +166,9 @@ impl Server {
 
                 Some(conn) = connections_authorized.join_next() => {
                     match conn? {
-                        Ok((addr, conn)) => {
+                        Ok((addr, handle, conn)) => {
                             piping.spawn(Box::pin(self.pipe(
-                                 addr, conn
+                                 addr, handle, conn
                             )));
                         }
                         Err(e) => tracing::warn!(?e, "error in authorized connection"),
@@ -172,8 +177,12 @@ impl Server {
 
                 Some(conn) = initial_connections.join_next() => {
                     match conn? {
-                        Ok(conn) => {
-                            connections_authorized.spawn(Box::pin(conn.handle_request()));
+                        Ok((socket_handle, conn)) => {
+                            connections_authorized.spawn(Box::pin(
+                            async move {
+                                conn.handle_request().await.map(|(addr, conn)| (addr, socket_handle, conn))
+                            }
+                        ));
                         },
                         Err(e) => tracing::warn!(?e, "error in initial connection"),
                     }
@@ -196,7 +205,7 @@ impl Server {
         &mut self,
         stream: TcpStream,
         client_addr: SocketAddr,
-    ) -> impl Future<Output = Result<Connection<Authorized>, Error>> {
+    ) -> impl Future<Output = Result<(SocketHandle, Connection<Authorized>), Error>> {
         tracing::info!(?client_addr, "new connection");
 
         let socket = tcp::Socket::new(
@@ -206,36 +215,34 @@ impl Server {
 
         let socket_handle = self.socket_set.lock().unwrap().add(socket);
 
-        Connection::new(
-            stream,
-            client_addr,
-            socket_handle,
-            self.resolver.clone(),
-            self.timeout,
-            self.user_pass.clone(),
-        )
-        .init_conn()
+        let resolver = self.resolver.clone();
+        let timeout = self.timeout;
+        let user_pass = self.user_pass.clone();
+        async move {
+            Connection::new(stream, client_addr, resolver, timeout, user_pass)
+                .init_conn()
+                .await
+                .map(|conn| (socket_handle, conn))
+        }
     }
     fn pipe(
         &mut self,
         addr: SocketAddr,
-        mut pipe: Connection<Piping>,
+        socket_handle: SocketHandle,
+        pipe: Connection<Piping>,
     ) -> impl Future<Output = Result<(), Error>> + Send {
         tracing::info!(?addr, "connection authorized");
 
-        {
-            let mut socket_set = self.socket_set.lock().unwrap();
-
-            let socket = socket_set.get_mut::<tcp::Socket>(pipe.socket_handle);
-
-            socket
-                .connect(
-                    self.iface.context(),
-                    (IpAddress::from(addr.ip()), addr.port()),
-                    dbg!(self.next_ephemeral_port.fetch_add(1, Ordering::SeqCst)),
-                )
-                .unwrap();
-        }
+        self.socket_set
+            .lock()
+            .unwrap()
+            .get_mut::<tcp::Socket>(socket_handle)
+            .connect(
+                self.iface.context(),
+                (IpAddress::from(addr.ip()), addr.port()),
+                dbg!(self.next_ephemeral_port.fetch_add(1, Ordering::SeqCst)),
+            )
+            .unwrap();
 
         let pipe = Arc::new(pipe);
         PipeFut {
@@ -243,6 +250,7 @@ impl Server {
             pipe,
             sending: false,
             socket_set: self.socket_set.clone(),
+            socket_handle,
             need_to_send_to_wg: None,
         }
     }
@@ -270,74 +278,72 @@ struct PipeFut {
     fut: Pin<Box<dyn Future<Output = Result<([u8; 8 * 1024], Option<usize>), Error>> + Send>>,
     sending: bool,
     socket_set: Arc<Mutex<SocketSet<'static>>>,
+    socket_handle: SocketHandle,
 
     need_to_send_to_wg: Option<([u8; 8 * 1024], SendToClient)>,
 }
 
-impl Future for PipeFut {
-    type Output = Result<(), Error>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let Self {
-            ref pipe,
-            ref mut fut,
-            ref mut sending,
-            ref mut socket_set,
-            ref mut need_to_send_to_wg,
-        } = *self;
-
-        let mut socket_set = socket_set.lock().unwrap();
-
-        let socket = socket_set.get_mut::<tcp::Socket>(pipe.socket_handle);
-
-        socket.register_recv_waker(cx.waker());
-        socket.register_send_waker(cx.waker());
-
-        if let Some((buf, SendToClient(to_send))) = need_to_send_to_wg.take() {
-            if socket.can_send() {
-                tracing::info!(?to_send, "sending through wireguard");
-                assert_eq!(socket.send_slice(&buf[0..to_send]).unwrap(), to_send);
-            } else {
-                *need_to_send_to_wg = Some((buf, SendToClient(to_send)));
-            }
-        }
-
-        let res = fut.as_mut().poll(cx);
-        match res {
+impl PipeFut {
+    pub fn handle_pipe_poll_res(
+        pipe: &Arc<Connection<Piping>>,
+        socket: &mut tcp::Socket,
+        sending: &mut bool,
+        fut: &mut Pin<
+            Box<dyn Future<Output = Result<([u8; 8 * 1024], Option<usize>), Error>> + Send>,
+        >,
+        socket_handle: SocketHandle,
+        need_to_send_to_wg: &mut Option<([u8; 8 * 1024], SendToClient)>,
+        cx: &mut Context<'_>,
+        poll: Poll<Result<([u8; 8 * 1024], Option<usize>), Error>>,
+    ) -> Poll<Result<(), Error>> {
+        match poll {
             Poll::Ready(to_send) => {
                 let (buf, to_send) = to_send?;
 
-                dbg!(&to_send);
+                tracing::info!(?to_send, ?sending, "READY TO SEND");
 
                 if let Some(to_send) = to_send {
-                    if dbg!(*sending) {
-                        // this means there's still stuff left in the buffer to send
-                        *fut = Box::pin(pipe.clone().pipe(buf, Some(SendToClient(to_send))));
+                    if to_send == 0 {
+                        tracing::info!("closing connection");
+                        socket.close();
+                        return Poll::Ready(Ok(()));
+                    }
+                    if dbg!(socket.can_send()) {
+                        tracing::info!(?to_send, "sending through wireguard");
+                        assert_eq!(socket.send_slice(&buf[0..to_send]).unwrap(), to_send);
                     } else {
-                        if to_send == 0 {
-                            tracing::info!("closing connection");
-                            socket.close();
-                            return Poll::Ready(Ok(()));
-                        }
-                        if dbg!(socket.can_send()) {
-                            tracing::info!(?to_send, "sending through wireguard");
-                            assert_eq!(socket.send_slice(&buf[0..to_send]).unwrap(), to_send);
-                        } else {
-                            *need_to_send_to_wg = Some((buf, SendToClient(to_send)));
-                        }
+                        tracing::info!("NEED TO SEND THROUGH WIREGUARD; COULDNT");
+                        *need_to_send_to_wg = Some((buf, SendToClient(to_send)));
                     }
                 }
 
+                tracing::info!("SENDING READ FUTURE");
+
                 *sending = false;
                 *fut = Box::pin(pipe.clone().pipe(buf, None));
+
+                let poll = fut.as_mut().poll(cx);
+
+                Self::handle_pipe_poll_res(
+                    pipe,
+                    socket,
+                    sending,
+                    fut,
+                    socket_handle,
+                    need_to_send_to_wg,
+                    cx,
+                    poll,
+                )
             }
             Poll::Pending if *sending => {
                 tracing::info!("waiting to send");
-                return Poll::Pending;
+                Poll::Pending
             }
             Poll::Pending => {
+                tracing::info!("WAITING TO RECV FROM SERVER");
+
                 if dbg!(socket.can_recv()) {
-                    tracing::info!("attempting to recv");
+                    tracing::info!("attempting to recv FROM WIREGUARD");
                     let new_fut = socket
                         .recv(|buf| {
                             tracing::error!(len = buf.len(), "recv'd");
@@ -351,14 +357,79 @@ impl Future for PipeFut {
                             )
                         })
                         .unwrap();
+
+                    tracing::info!("SENDING SEND FUTURE 2");
                     *sending = true;
                     *fut = new_fut;
+
+                    let poll = fut.as_mut().poll(cx);
+
+                    Self::handle_pipe_poll_res(
+                        pipe,
+                        socket,
+                        sending,
+                        fut,
+                        socket_handle,
+                        need_to_send_to_wg,
+                        cx,
+                        poll,
+                    )
+                } else {
+                    Poll::Pending
                 }
             }
         }
+    }
+}
 
-        tracing::error!("wowza");
+impl Future for PipeFut {
+    type Output = Result<(), Error>;
 
-        Poll::Pending
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Self {
+            ref pipe,
+            ref mut fut,
+            ref mut sending,
+            ref mut socket_set,
+            ref mut socket_handle,
+            ref mut need_to_send_to_wg,
+        } = *self;
+
+        let mut socket = {
+            let mut socket_set = socket_set.lock().unwrap();
+
+            match socket_set.remove(*socket_handle) {
+                smoltcp::socket::Socket::Tcp(socket) => socket,
+                _ => unreachable!(),
+            }
+        };
+
+        socket.register_recv_waker(cx.waker());
+        socket.register_send_waker(cx.waker());
+
+        if let Some((buf, SendToClient(to_send))) = need_to_send_to_wg.take() {
+            if socket.can_send() {
+                tracing::info!(?to_send, "sending through wireguard");
+                assert_eq!(socket.send_slice(&buf[0..to_send]).unwrap(), to_send);
+            } else {
+                *need_to_send_to_wg = Some((buf, SendToClient(to_send)));
+            }
+        }
+
+        let poll = fut.as_mut().poll(cx);
+        let res = Self::handle_pipe_poll_res(
+            pipe,
+            &mut socket,
+            sending,
+            fut,
+            *socket_handle,
+            need_to_send_to_wg,
+            cx,
+            poll,
+        );
+
+        *socket_handle = socket_set.lock().unwrap().add(socket);
+
+        res
     }
 }
