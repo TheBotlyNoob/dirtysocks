@@ -1,11 +1,9 @@
 #![allow(clippy::missing_errors_doc)]
 use hickory_resolver::TokioAsyncResolver;
 use seq_macro::seq;
-use smoltcp::iface::SocketHandle;
 use std::{
     marker::PhantomData,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
-    sync::Arc,
     time::Duration,
 };
 use strum::FromRepr;
@@ -139,17 +137,17 @@ pub struct Authorized;
 pub struct Piping;
 
 pub struct Connection<State> {
-    stream: TcpStream,
+    pub stream: TcpStream,
     client_addr: SocketAddr,
     resolver: TokioAsyncResolver,
     timeout: Duration,
-    pub buf: [u8; 8 * 1024],
+    pub buf: Vec<u8>,
     user_pass: Option<crate::UserPass>,
 
     _state: PhantomData<State>,
 }
 impl Connection<Initial> {
-    pub const fn new(
+    pub fn new(
         stream: TcpStream,
         client_addr: SocketAddr,
         resolver: TokioAsyncResolver,
@@ -161,7 +159,7 @@ impl Connection<Initial> {
             client_addr,
             resolver,
             timeout,
-            buf: [0; 8 * 1024],
+            buf: vec![0; 8 * 1024],
             user_pass,
             _state: PhantomData,
         }
@@ -377,46 +375,6 @@ impl Connection<Authorized> {
 
             Ok(Command { addr, ty, version })
         })
-    }
-}
-
-pub struct SendToClient(pub usize);
-impl Connection<Piping> {
-    pub async fn pipe(
-        self: Arc<Self>,
-        mut buf: [u8; 8 * 1024],
-        resp_len: Option<SendToClient>,
-    ) -> Result<([u8; 8 * 1024], Option<usize>), Error> {
-        if let Some(mut resp_len) = resp_len {
-            loop {
-                self.stream.writable().await?;
-
-                match self.stream.try_write(&buf[..resp_len.0]) {
-                    Ok(n) => {
-                        if n == resp_len.0 {
-                            break Ok((buf, None));
-                        }
-
-                        buf.rotate_left(n);
-                        resp_len.0 -= n;
-
-                        continue;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(e) => break Err(e.into()),
-                }
-            }
-        } else {
-            loop {
-                self.stream.readable().await?;
-
-                match self.stream.try_read(&mut buf) {
-                    Ok(n) => break Ok((buf, Some(n))),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(e) => break Err(e.into()),
-                }
-            }
-        }
     }
 }
 
