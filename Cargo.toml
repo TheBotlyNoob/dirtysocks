@@ -21,8 +21,4 @@ smallvec = { version = "1.13.2", features = ["union"] }
 smoltcp = "0.11.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 base64 = "0.22.1"
-crossbeam-queue = "0.3.11"
-deadqueue = { version = "0.2.4", default-features = false, features = [
-    "unlimited",
-] }
 rand = "0.8.5"

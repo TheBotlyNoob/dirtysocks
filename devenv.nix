@@ -4,7 +4,7 @@
   # https://devenv.sh/basics/
 
   # https://devenv.sh/packages/
-  packages = with pkgs; [ git ];
+  packages = with pkgs; [ git wireproxy hyperfine ];
 
   # https://devenv.sh/scripts/
   # scripts.hello.exec = "echo hello from $GREET";

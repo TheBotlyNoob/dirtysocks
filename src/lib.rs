@@ -12,9 +12,9 @@ use smoltcp::{
 };
 use std::{
     convert::Infallible,
-    future::Future,
+    future::{poll_fn, Future},
     net::{IpAddr, SocketAddr},
-    pin::Pin,
+    pin::{pin, Pin},
     sync::{
         atomic::{AtomicU16, Ordering},
         Arc, Mutex,
@@ -25,8 +25,10 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream, UdpSocket},
+    sync::Notify,
     task::JoinSet,
 };
+use tracing::instrument;
 
 pub mod wg;
 use wg::Peer;
@@ -83,7 +85,8 @@ pub struct Server {
     pub resolver: TokioAsyncResolver,
     pub timeout: Duration,
     pub user_pass: Option<UserPass>,
-    next_ephemeral_port: Arc<AtomicU16>,
+    update_notify: Arc<Notify>,
+    next_ephemeral_port: u16,
 }
 
 // TODO: reuse sockets
@@ -122,7 +125,8 @@ impl Server {
             resolver,
             timeout,
             user_pass,
-            next_ephemeral_port: Arc::new(AtomicU16::new(1)),
+            update_notify: Arc::new(Notify::new()),
+            next_ephemeral_port: 1,
         })
     }
 
@@ -135,9 +139,9 @@ impl Server {
             tracing::info!("no authentication required");
         }
 
-        let mut poll_next = tokio::time::Instant::now();
+        let mut poll_next = self.poll_iface();
 
-        let mut update_timers_next = tokio::time::Instant::now();
+        let mut update_timers_next = pin!(tokio::time::sleep(Duration::ZERO));
 
         let mut initial_connections: JoinSet<
             Result<(SocketAddr, SocketHandle, Connection<Piping>), Error>,
@@ -146,8 +150,6 @@ impl Server {
 
         loop {
             tokio::select! {
-                biased;
-
                 Ok((stream, client_addr)) = self.listener.accept() => {
                     initial_connections.spawn(Box::pin(self.new_conn(
                         stream,
@@ -172,12 +174,10 @@ impl Server {
                     }
                 }
 
-                () = tokio::time::sleep_until(poll_next) => {
+                () = poll_next.as_mut() => {
                     poll_next = self.poll_iface();
                 }
-                res = self.peer.poll_device(&mut update_timers_next) => {
-                    update_timers_next = tokio::time::Instant::now();
-
+                res = self.peer.poll_device(update_timers_next.as_mut()) => {
                     if let Err(e) = res {
                         tracing::warn!(?e, "error in peer device polling");
                     }
@@ -227,47 +227,112 @@ impl Server {
             .connect(
                 self.iface.context(),
                 (IpAddress::from(addr.ip()), addr.port()),
-                dbg!(self.next_ephemeral_port.fetch_add(1, Ordering::SeqCst)),
+                self.next_ephemeral_port,
             )
             .unwrap();
+        self.next_ephemeral_port += 1;
+        self.update_notify.notify_one();
 
-        Self::pipe_inner(self.socket_set.clone(), socket_handle, pipe)
+        Self::pipe_inner(
+            self.socket_set.clone(),
+            socket_handle,
+            self.update_notify.clone(),
+            pipe,
+        )
     }
 
     async fn pipe_inner(
         socket_set: Arc<Mutex<SocketSet<'static>>>,
         socket_handle: SocketHandle,
+        update_notify: Arc<Notify>,
         mut pipe: Connection<Piping>,
     ) -> Result<(), Error> {
         let mut sock = AsyncSocket {
             socket_set: socket_set.clone(),
             socket_handle,
+            update_notify,
         };
+
+        sock.valid_state().await;
         tokio::io::copy_bidirectional(&mut sock, &mut pipe.stream).await?;
+
         Ok(())
     }
 
-    fn poll_iface(&mut self) -> tokio::time::Instant {
+    #[instrument(name = "poll_iface", skip(self))]
+    fn poll_iface(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let std_now = std::time::Instant::now();
         let smoltcp_now = smoltcp::time::Instant::from(std_now);
         let tokio_now = tokio::time::Instant::from_std(std_now);
 
-        let delay = {
+        let (delay, processed) = {
             let mut socket_set = self.socket_set.lock().unwrap();
 
-            self.iface
+            let processed = self
+                .iface
                 .poll(smoltcp_now, &mut self.peer, &mut socket_set);
 
-            self.iface.poll_delay(smoltcp_now, &socket_set)
+            let delay = self.iface.poll_delay(smoltcp_now, &socket_set);
+
+            (delay, processed)
         };
 
-        tokio_now + Duration::from_micros(delay.map_or(0, |d| d.total_micros().saturating_sub(50)))
+        let micros = delay.map_or(0, |d| d.total_micros().saturating_sub(50));
+        if micros == 0 {
+            tracing::warn!("waiting for device for next poll");
+
+            let device_notify = self.peer.notify.clone();
+            let conn_notify = self.update_notify.clone();
+            Box::pin(async move {
+                tokio::select! {
+                    () = device_notify.notified() => {}
+                    () = conn_notify.notified() => {}
+                }
+            })
+        } else {
+            let wait_dur = Duration::from_micros(micros);
+            let next_wake = tokio_now + wait_dur;
+            tracing::warn!(next_wake_ms = wait_dur.as_millis(), "polling iface");
+
+            let device_notify = self.peer.notify.clone();
+            let conn_notify = self.update_notify.clone();
+            Box::pin(async move {
+                tokio::select! {
+                    () = tokio::time::sleep_until(next_wake) => {}
+                    () = device_notify.notified() => {}
+                    () = conn_notify.notified() => {}
+                }
+            })
+        }
     }
 }
 
 pub struct AsyncSocket {
     pub socket_set: Arc<Mutex<SocketSet<'static>>>,
     pub socket_handle: SocketHandle,
+    pub update_notify: Arc<Notify>,
+}
+impl AsyncSocket {
+    pub fn valid_state(&self) -> impl Future<Output = ()> + Send {
+        let socket_set = self.socket_set.clone();
+        let socket_handle = self.socket_handle;
+        let update_notify = self.update_notify.clone();
+
+        poll_fn(move |cx| {
+            let mut socket_set = socket_set.lock().unwrap();
+            let socket = socket_set.get_mut::<tcp::Socket>(socket_handle);
+
+            socket.register_send_waker(cx.waker());
+            socket.register_recv_waker(cx.waker());
+
+            if socket.state() == tcp::State::Established {
+                Poll::Ready(())
+            } else {
+                update_notify.notify_one();
+                Poll::Pending
+            }
+        })
+    }
 }
 impl AsyncRead for AsyncSocket {
     fn poll_read(
@@ -281,12 +346,12 @@ impl AsyncRead for AsyncSocket {
         socket.register_recv_waker(cx.waker());
 
         match socket.recv_slice(buf.initialize_unfilled()) {
+            Ok(0) => Poll::Pending,
             Ok(ready) => {
                 buf.advance(ready);
                 Poll::Ready(Ok(()))
             }
-            Err(tcp::RecvError::Finished) => Poll::Ready(Ok(())),
-            Err(tcp::RecvError::InvalidState) => Poll::Pending,
+            Err(_) => Poll::Ready(Ok(())),
         }
     }
 }
@@ -302,8 +367,12 @@ impl AsyncWrite for AsyncSocket {
         socket.register_send_waker(cx.waker());
 
         match socket.send_slice(buf) {
-            Ok(0) | Err(tcp::SendError::InvalidState) => Poll::Pending,
-            Ok(ready) => Poll::Ready(Ok(ready)),
+            Ok(0) => Poll::Pending,
+            Ok(ready) => {
+                self.update_notify.notify_one();
+                Poll::Ready(Ok(ready))
+            }
+            Err(_) => Poll::Ready(Ok(0)),
         }
     }
 
@@ -315,7 +384,10 @@ impl AsyncWrite for AsyncSocket {
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut socket_set = self.socket_set.lock().unwrap();
         let socket = socket_set.get_mut::<tcp::Socket>(self.socket_handle);
+        tracing::warn!("shutting down socket");
         socket.close();
+
+        self.update_notify.notify_one();
 
         Poll::Ready(Ok(()))
     }

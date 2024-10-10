@@ -6,10 +6,15 @@ use smoltcp::{
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::{MutexGuard, PoisonError},
+    pin::Pin,
+    sync::{Arc, MutexGuard, PoisonError},
     time::Duration,
 };
-use tokio::{net::UdpSocket, time::Instant};
+use tokio::{
+    net::UdpSocket,
+    sync::Notify,
+    time::{Instant, Sleep},
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -42,6 +47,8 @@ pub struct Peer {
 
     pub tx_queue: VecDeque<Vec<u8>>,
     pub rx_queue: VecDeque<Vec<u8>>,
+
+    pub notify: Arc<Notify>,
 }
 
 impl Peer {
@@ -53,10 +60,12 @@ impl Peer {
 
             tx_queue: VecDeque::new(),
             rx_queue: VecDeque::new(),
+
+            notify: Arc::new(Notify::new()),
         }
     }
 
-    pub async fn poll_device(&mut self, update_next: &mut Instant) -> Result<(), Error> {
+    pub async fn poll_device(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), Error> {
         let packet = self.tx_queue.pop_back();
         if let Some(packet) = packet {
             self.handle_peer_tx_packet(&packet).await?;
@@ -64,14 +73,12 @@ impl Peer {
 
         let mut rx_buf = vec![0; 8 * 1024];
         tokio::select! {
-            biased;
-
             read = self.conn.recv(&mut rx_buf) => {
                 let read = read?;
                 self.handle_peer_rx_packet(&rx_buf[0..read]).await?;
             }
-            () = tokio::time::sleep_until(*update_next) => {
-                *update_next = Instant::now() + Duration::from_millis(500);
+            () = sleep.as_mut() => {
+                sleep.reset(Instant::now() + Duration::from_secs(1));
 
                 self.update_timers(&mut [0; 148]).await.unwrap();
             }
@@ -88,9 +95,13 @@ impl Peer {
         match res {
             // send to CF Warp
             TunnResult::WriteToNetwork(packet) => {
-                tracing::debug!(num_bytes = packet.len(), "writing to peer network");
+                tracing::debug!(
+                    num_bytes = packet.len(),
+                    "writing to peer network from sending to wireguard"
+                );
 
                 assert_eq!(self.conn.send(packet).await?, packet.len());
+
                 Ok(())
             }
             // send to clients
@@ -119,15 +130,21 @@ impl Peer {
 
             match result {
                 TunnResult::WriteToNetwork(packet) => {
-                    tracing::debug!(num_bytes = packet.len(), "writing to peer network");
+                    tracing::debug!(
+                        num_bytes = packet.len(),
+                        "writing to peer network from decapsulate"
+                    );
 
                     assert_eq!(self.conn.send(packet).await?, packet.len());
                     continue;
                 }
 
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                    tracing::info!("WRITE TO SMOL DEVICE");
+                    tracing::info!("WRITE TO SMOL DEVICE from decapsulate");
+
                     self.rx_queue.push_front(packet.to_vec());
+                    self.notify.notify_one();
+
                     break;
                 }
 
@@ -141,12 +158,15 @@ impl Peer {
 
     /// Must be called often.
     pub async fn update_timers(&mut self, buf: &mut [u8]) -> Result<(), Error> {
-        tracing::debug!("updating timers...");
+        //tracing::debug!("updating timers...");
 
         let res = self.tunn.update_timers(buf);
         match res {
             TunnResult::WriteToNetwork(packet) => {
-                tracing::debug!(num_bytes = packet.len(), "writing to peer network");
+                tracing::debug!(
+                    num_bytes = packet.len(),
+                    "writing to peer network from updating timers"
+                );
 
                 assert_eq!(self.conn.send(packet).await?, packet.len());
 
