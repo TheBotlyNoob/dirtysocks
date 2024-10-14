@@ -150,6 +150,14 @@ impl Server {
 
         loop {
             tokio::select! {
+                biased;
+
+                res = self.peer.poll_device(update_timers_next.as_mut()) => {
+                    if let Err(e) = res {
+                        tracing::warn!(?e, "error in peer device polling");
+                    }
+                }
+
                 Ok((stream, client_addr)) = self.listener.accept() => {
                     initial_connections.spawn(Box::pin(self.new_conn(
                         stream,
@@ -176,11 +184,6 @@ impl Server {
 
                 () = poll_next.as_mut() => {
                     poll_next = self.poll_iface();
-                }
-                res = self.peer.poll_device(update_timers_next.as_mut()) => {
-                    if let Err(e) = res {
-                        tracing::warn!(?e, "error in peer device polling");
-                    }
                 }
             }
         }

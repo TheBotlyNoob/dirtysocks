@@ -66,9 +66,8 @@ impl Peer {
     }
 
     pub async fn poll_device(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), Error> {
-        let packet = self.tx_queue.pop_back();
-        if let Some(packet) = packet {
-            self.handle_peer_tx_packet(&packet).await?;
+        for packet in self.tx_queue.drain(..) {
+            Self::handle_peer_tx_packet(&mut self.tunn, &self.conn, &packet).await?;
         }
 
         let mut rx_buf = vec![0; 8 * 1024];
@@ -87,10 +86,14 @@ impl Peer {
         Ok(())
     }
 
-    pub async fn handle_peer_tx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
+    pub async fn handle_peer_tx_packet(
+        tunn: &mut Tunn,
+        conn: &UdpSocket,
+        packet: &[u8],
+    ) -> Result<(), Error> {
         let mut out = vec![0; (packet.len() + 32).max(148)];
 
-        let res = self.tunn.encapsulate(packet, &mut out);
+        let res = tunn.encapsulate(packet, &mut out);
 
         match res {
             // send to CF Warp
@@ -100,7 +103,7 @@ impl Peer {
                     "writing to peer network from sending to wireguard"
                 );
 
-                assert_eq!(self.conn.send(packet).await?, packet.len());
+                assert_eq!(conn.send(packet).await?, packet.len());
 
                 Ok(())
             }
