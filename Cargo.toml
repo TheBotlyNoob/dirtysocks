@@ -22,3 +22,13 @@ smoltcp = "0.11.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 base64 = "0.22.1"
 rand = "0.8.5"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+debug = false
+
+[profile.profiling]
+inherits = "release"
+debug = true
