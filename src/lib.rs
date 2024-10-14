@@ -244,6 +244,7 @@ impl Server {
         )
     }
 
+    #[instrument(name = "pipe", skip(socket_set, socket_handle, update_notify, pipe))]
     async fn pipe_inner(
         socket_set: Arc<Mutex<SocketSet<'static>>>,
         socket_handle: SocketHandle,

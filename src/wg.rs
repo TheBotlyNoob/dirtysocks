@@ -15,6 +15,7 @@ use tokio::{
     sync::Notify,
     time::{Instant, Sleep},
 };
+use tracing::instrument;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -65,6 +66,7 @@ impl Peer {
         }
     }
 
+    #[instrument(skip(self, sleep))]
     pub async fn poll_device(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), Error> {
         for packet in self.tx_queue.drain(..) {
             Self::handle_peer_tx_packet(&mut self.tunn, &self.conn, &packet).await?;
@@ -86,6 +88,7 @@ impl Peer {
         Ok(())
     }
 
+    #[instrument(skip(tunn, conn, packet))]
     pub async fn handle_peer_tx_packet(
         tunn: &mut Tunn,
         conn: &UdpSocket,
@@ -98,10 +101,7 @@ impl Peer {
         match res {
             // send to CF Warp
             TunnResult::WriteToNetwork(packet) => {
-                tracing::debug!(
-                    num_bytes = packet.len(),
-                    "writing to peer network from sending to wireguard"
-                );
+                tracing::debug!(num_bytes = packet.len(), "writing to peer network");
 
                 assert_eq!(conn.send(packet).await?, packet.len());
 
@@ -117,6 +117,7 @@ impl Peer {
         }
     }
 
+    #[instrument(skip(self, packet))]
     pub async fn handle_peer_rx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
         tracing::info!(len = packet.len(), "recieved packet peer");
 
@@ -133,17 +134,14 @@ impl Peer {
 
             match result {
                 TunnResult::WriteToNetwork(packet) => {
-                    tracing::debug!(
-                        num_bytes = packet.len(),
-                        "writing to peer network from decapsulate"
-                    );
+                    tracing::debug!(num_bytes = packet.len(), "writing to peer network");
 
                     assert_eq!(self.conn.send(packet).await?, packet.len());
                     continue;
                 }
 
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                    tracing::info!("WRITE TO SMOL DEVICE from decapsulate");
+                    tracing::info!("WRITE TO SMOL DEVICE");
 
                     self.rx_queue.push_front(packet.to_vec());
                     self.notify.notify_one();
@@ -160,16 +158,14 @@ impl Peer {
     }
 
     /// Must be called often.
+    #[instrument(skip(self, buf))]
     pub async fn update_timers(&mut self, buf: &mut [u8]) -> Result<(), Error> {
         //tracing::debug!("updating timers...");
 
         let res = self.tunn.update_timers(buf);
         match res {
             TunnResult::WriteToNetwork(packet) => {
-                tracing::debug!(
-                    num_bytes = packet.len(),
-                    "writing to peer network from updating timers"
-                );
+                tracing::debug!(num_bytes = packet.len(), "writing to peer network");
 
                 assert_eq!(self.conn.send(packet).await?, packet.len());
 
