@@ -2,31 +2,36 @@
 #![allow(clippy::missing_errors_doc)]
 
 use boringtun::noise::Tunn;
+use futures_util::{future::Either, stream::FuturesUnordered, StreamExt};
 use handler::{Connection, Piping};
 use hickory_resolver::TokioAsyncResolver;
 use smoltcp::{
     iface::{self, Config, SocketHandle, SocketSet},
-    socket::tcp::{self, SocketBuffer},
-    time::Instant,
+    socket::{
+        tcp::{self, SocketBuffer},
+        AnySocket,
+    },
+    time::{Duration as SmolDuration, Instant as SmolInstant},
     wire::{HardwareAddress, IpAddress, IpCidr},
 };
 use std::{
+    collections::HashMap,
     convert::Infallible,
     future::{poll_fn, Future},
     net::{IpAddr, SocketAddr},
     pin::{pin, Pin},
-    sync::{
-        atomic::{AtomicU16, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration as StdDuration, Instant as StdInstant},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::Notify,
-    task::JoinSet,
+    sync::{
+        mpsc::{Receiver, Sender},
+        Notify,
+    },
+    time::Instant as TokioInstant,
 };
 use tracing::instrument;
 
@@ -76,17 +81,29 @@ pub struct UserPass {
     pub password: String,
 }
 
+#[derive(Debug)]
+enum ToWgMsg {
+    Connect(SocketAddr, Sender<FromWgMsg>),
+    Data(SocketHandle, Vec<u8>),
+    Close(SocketHandle),
+}
+
+#[derive(Debug)]
+enum FromWgMsg {
+    Connect(SocketHandle),
+    Data(Vec<u8>),
+    Close,
+}
+
 /// A socks5 server implementation, sending data to a single `WireGuard` peer.
 pub struct Server {
     pub listener: TcpListener,
-    pub peer: wg::Peer,
-    pub iface: iface::Interface,
-    pub socket_set: Arc<Mutex<SocketSet<'static>>>,
+    pub poll_iface: Option<PollIface>,
+    pub socket_tx: Sender<ToWgMsg>,
     pub resolver: TokioAsyncResolver,
-    pub timeout: Duration,
+    pub timeout: StdDuration,
     pub user_pass: Option<UserPass>,
-    update_notify: Arc<Notify>,
-    next_ephemeral_port: u16,
+    pub next_ephemeral_port: u16,
 }
 
 // TODO: reuse sockets
@@ -97,7 +114,7 @@ impl Server {
         tunn: Tunn,
         endpoint_addr: SocketAddr,
         resolver: TokioAsyncResolver,
-        timeout: Duration,
+        timeout: StdDuration,
         user_pass: Option<UserPass>,
         iface_addr: IpAddr,
     ) -> Result<Self, Error> {
@@ -109,7 +126,7 @@ impl Server {
         let mut iface_conf = Config::new(HardwareAddress::Ip);
         iface_conf.random_seed = rand::random();
 
-        let mut iface = iface::Interface::new(iface_conf, &mut peer, Instant::now());
+        let mut iface = iface::Interface::new(iface_conf, &mut peer, SmolInstant::now());
 
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs
@@ -117,15 +134,21 @@ impl Server {
                 .unwrap();
         });
 
+        let (socket_tx, socket_rx) = tokio::sync::mpsc::channel(128);
+
         Ok(Self {
             listener,
-            peer,
-            iface,
-            socket_set: Arc::new(Mutex::new(SocketSet::new(Vec::new()))),
+            poll_iface: Some(PollIface {
+                socket_rx,
+                sockets_tx: HashMap::new(),
+                iface,
+                socket_set: SocketSet::new(Vec::new()),
+                peer,
+            }),
+            socket_tx,
             resolver,
             timeout,
             user_pass,
-            update_notify: Arc::new(Notify::new()),
             next_ephemeral_port: 1,
         })
     }
@@ -139,14 +162,18 @@ impl Server {
             tracing::info!("no authentication required");
         }
 
-        let mut poll_next = self.poll_iface();
+        let mut poll_now = std::time::Instant::now();
+        let mut poll_next = self.poll_iface(poll_now);
 
-        let mut update_timers_next = pin!(tokio::time::sleep(Duration::ZERO));
+        let mut update_timers_next = pin!(tokio::time::sleep(StdDuration::ZERO));
 
-        let mut initial_connections: JoinSet<
-            Result<(SocketAddr, SocketHandle, Connection<Piping>), Error>,
-        > = JoinSet::new();
-        let mut piping: JoinSet<Result<(), Error>> = JoinSet::new();
+        let mut initial_connections = FuturesUnordered::new();
+        let mut piping = FuturesUnordered::new();
+
+        let poll_iface = self.poll_iface.take().unwrap();
+        tokio::spawn(poll_iface.poll_iface());
+
+        let peer_notify = self.peer.notify.clone();
 
         loop {
             tokio::select! {
@@ -159,31 +186,32 @@ impl Server {
                 }
 
                 Ok((stream, client_addr)) = self.listener.accept() => {
-                    initial_connections.spawn(Box::pin(self.new_conn(
+                    initial_connections.push(self.new_conn(
                         stream,
                         client_addr,
-                    )));
+                    ));
                 }
 
-                Some(conn) = initial_connections.join_next() => {
-                    match conn? {
+                Some(conn) = initial_connections.next() => {
+                    match conn {
                         Ok((addr, handle, conn)) => {
-                            piping.spawn(Box::pin(self.pipe(
+                            piping.push(self.pipe(
                                  addr, handle, conn
-                            )));
+                           ));
                         }
                         Err(e) => tracing::warn!(?e, "error in authorized connection"),
                     }
                 }
 
-                Some(conn) = piping.join_next() => {
-                    if let Err(e) = conn? {
-                        tracing::warn!(?e, "error in piping connection");
-                    }
+                () = Self::wait_for_poll_iface(peer_notify.clone(), self.new_conn_notify.clone(), poll_now, poll_next) => {
+                    poll_now = std::time::Instant::now();
+                    poll_next = self.poll_iface(poll_now);
                 }
 
-                () = poll_next.as_mut() => {
-                    poll_next = self.poll_iface();
+                Some(conn) = piping.next() => {
+                    if let Err(e) = conn {
+                        tracing::warn!(?e, "error in piping connection");
+                    }
                 }
             }
         }
@@ -220,11 +248,11 @@ impl Server {
         addr: SocketAddr,
         socket_handle: SocketHandle,
         pipe: Connection<Piping>,
-    ) -> impl Future<Output = Result<(), Error>> + Send {
+    ) -> impl Future<Output = Result<(), Error>> {
         tracing::info!(?addr, "connection authorized");
 
         self.socket_set
-            .lock()
+            .try_lock()
             .unwrap()
             .get_mut::<tcp::Socket>(socket_handle)
             .connect(
@@ -234,12 +262,12 @@ impl Server {
             )
             .unwrap();
         self.next_ephemeral_port += 1;
-        self.update_notify.notify_one();
+        self.new_conn_notify.notify_one();
 
         Self::pipe_inner(
             self.socket_set.clone(),
             socket_handle,
-            self.update_notify.clone(),
+            self.new_conn_notify.clone(),
             pipe,
         )
     }
@@ -264,10 +292,8 @@ impl Server {
     }
 
     #[instrument(name = "poll_iface", skip(self))]
-    fn poll_iface(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let std_now = std::time::Instant::now();
-        let smoltcp_now = smoltcp::time::Instant::from(std_now);
-        let tokio_now = tokio::time::Instant::from_std(std_now);
+    fn poll_iface(&mut self, now: std::time::Instant) -> Option<SmolDuration> {
+        let smoltcp_now = smoltcp::time::Instant::from(now);
 
         let (delay, processed) = {
             let mut socket_set = self.socket_set.lock().unwrap();
@@ -281,32 +307,133 @@ impl Server {
             (delay, processed)
         };
 
-        let micros = delay.map_or(0, |d| d.total_micros().saturating_sub(50));
-        if micros == 0 {
-            tracing::warn!("waiting for device for next poll");
+        delay
+    }
+}
 
-            let device_notify = self.peer.notify.clone();
-            let conn_notify = self.update_notify.clone();
-            Box::pin(async move {
-                tokio::select! {
-                    () = device_notify.notified() => {}
-                    () = conn_notify.notified() => {}
-                }
-            })
-        } else {
-            let wait_dur = Duration::from_micros(micros);
-            let next_wake = tokio_now + wait_dur;
-            tracing::warn!(next_wake_ms = wait_dur.as_millis(), "polling iface");
+struct PollIface {
+    socket_rx: Receiver<ToWgMsg>,
+    sockets_tx: HashMap<SocketHandle, Sender<FromWgMsg>>,
+    iface: iface::Interface,
+    peer: wg::Peer,
+    socket_set: SocketSet<'static>,
+    next_ephemeral_port: u16,
+}
 
-            let device_notify = self.peer.notify.clone();
-            let conn_notify = self.update_notify.clone();
-            Box::pin(async move {
-                tokio::select! {
-                    () = tokio::time::sleep_until(next_wake) => {}
-                    () = device_notify.notified() => {}
-                    () = conn_notify.notified() => {}
+impl PollIface {
+    pub async fn poll_iface(mut self) {
+        let mut last_iface_poll = StdInstant::now();
+        let mut iface_poll_delay = None;
+
+        let mut did_something = false;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                Some(msg) = self.socket_rx.recv() => self.handle_msg(msg),
+
+                _ = Self::wait_for_poll_iface(last_iface_poll, iface_poll_delay) => {
+                    last_iface_poll = StdInstant::now();
+                    let smoltcp_now = SmolInstant::from(last_iface_poll);
+
+                    let (delay, processed) = {
+                        let processed = self.iface.poll(smoltcp_now, &mut self.peer, &mut self.socket_set);
+
+                        let delay = self.iface.poll_delay(smoltcp_now, &self.socket_set);
+
+                        (delay, processed)
+                    };
+
+                    iface_poll_delay = delay;
+
+                    self.poll_sockets().await;
                 }
-            })
+            }
+        }
+    }
+
+    async fn poll_sockets(&mut self) {
+        futures_util::future::join_all(self.socket_set.iter_mut().map(|(handle, socket)| {
+            let socket = tcp::Socket::downcast_mut(socket).unwrap();
+
+            if socket.can_recv() {
+                let sender = self.sockets_tx.get_mut(&handle).unwrap();
+
+                let mut buf = [0; 8 * 1024];
+                let read = socket.recv_slice(&mut buf).unwrap();
+
+                let data = buf[..read].to_vec();
+
+                let sender = sender.clone();
+                Either::Left(async move {
+                    sender.send(FromWgMsg::Data(data)).await.unwrap();
+                })
+            } else {
+                Either::Right(async {})
+            }
+        }))
+        .await;
+    }
+
+    async fn send_to(&mut self, handle: SocketHandle, msg: FromWgMsg) {
+        let sender = self.sockets_tx.get_mut(&handle).unwrap();
+        sender.send(msg).await.unwrap();
+    }
+
+    fn handle_msg(&mut self, msg: ToWgMsg) {
+        match msg {
+            ToWgMsg::Connect(addr, sender) => {
+                let mut socket = tcp::Socket::new(
+                    SocketBuffer::new(vec![0; 8 * 1024]),
+                    SocketBuffer::new(vec![0; 8 * 1024]),
+                );
+
+                socket
+                    .connect(
+                        self.iface.context(),
+                        (IpAddress::from(addr.ip()), addr.port()),
+                        self.next_ephemeral_port,
+                    )
+                    .unwrap();
+
+                self.next_ephemeral_port += 1;
+
+                let handle = self.socket_set.add(socket);
+
+                self.sockets_tx.insert(handle, sender);
+            }
+            ToWgMsg::Data(handle, data) => {
+                let socket = self.socket_set.get_mut::<tcp::Socket>(handle);
+
+                socket.send_slice(&data).unwrap();
+            }
+            ToWgMsg::Close(handle) => {
+                self.socket_set.get_mut::<tcp::Socket>(handle).close();
+            }
+        }
+    }
+
+    fn wait_for_poll_iface(
+        now: std::time::Instant,
+        delay: Option<SmolDuration>,
+    ) -> impl Future<Output = ()> {
+        match delay {
+            None => {
+                tracing::warn!("waiting for device for next poll");
+
+                Either::Left(Either::Left(std::future::pending()))
+            }
+            Some(SmolDuration::ZERO) => Either::Left(Either::Right(std::future::ready(()))),
+            Some(delay) => {
+                let wait_dur = StdDuration::from_micros(delay.total_micros());
+                let next_wake = now + wait_dur;
+                tracing::warn!(next_wake_ms = wait_dur.as_millis(), elapsed = ?std::time::Instant::now().saturating_duration_since(now), "polling iface");
+
+                Either::Right(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    next_wake,
+                )))
+            }
         }
     }
 }
@@ -317,13 +444,15 @@ pub struct AsyncSocket {
     pub update_notify: Arc<Notify>,
 }
 impl AsyncSocket {
-    pub fn valid_state(&self) -> impl Future<Output = ()> + Send {
+    pub fn valid_state(&self) -> impl Future<Output = ()> {
         let socket_set = self.socket_set.clone();
         let socket_handle = self.socket_handle;
         let update_notify = self.update_notify.clone();
 
         poll_fn(move |cx| {
-            let mut socket_set = socket_set.lock().unwrap();
+            tracing::info!("checking for sendable socket state");
+
+            let mut socket_set = socket_set.try_lock().unwrap();
             let socket = socket_set.get_mut::<tcp::Socket>(socket_handle);
 
             socket.register_send_waker(cx.waker());
@@ -344,7 +473,9 @@ impl AsyncRead for AsyncSocket {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut socket_set = self.socket_set.lock().unwrap();
+        tracing::info!(handle = ?self.socket_handle, "polling socket read");
+
+        let mut socket_set = self.socket_set.try_lock().unwrap();
         let socket = socket_set.get_mut::<tcp::Socket>(self.socket_handle);
 
         socket.register_recv_waker(cx.waker());
@@ -365,7 +496,9 @@ impl AsyncWrite for AsyncSocket {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut socket_set = self.socket_set.lock().unwrap();
+        tracing::info!("polling socket write");
+
+        let mut socket_set = self.socket_set.try_lock().unwrap();
         let socket = socket_set.get_mut::<tcp::Socket>(self.socket_handle);
 
         socket.register_send_waker(cx.waker());
@@ -386,7 +519,9 @@ impl AsyncWrite for AsyncSocket {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut socket_set = self.socket_set.lock().unwrap();
+        tracing::info!("shutting down socket");
+
+        let mut socket_set = self.socket_set.try_lock().unwrap();
         let socket = socket_set.get_mut::<tcp::Socket>(self.socket_handle);
         tracing::warn!("shutting down socket");
         socket.close();

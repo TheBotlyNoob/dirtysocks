@@ -8,12 +8,12 @@ tokio = { version = "1.40.0", default-features = false, features = [
     "net",
     "macros",
     "sync",
-    "rt-multi-thread",
+    "rt",
 ] }
 hickory-resolver = "0.24.1"
 strum = { version = "0.26.2", features = ["derive"] }
 untrusted = "0.9.0"
-boringtun = "0.6.0"
+boringtun = { version = "0.6.0", git = "https://github.com/NordSecurity/boringtun?ref=0bba376" }
 seq-macro = "0.3.5"
 tracing = "0.1.40"
 thiserror = "1.0.64"
@@ -22,6 +22,7 @@ smoltcp = "0.11.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 base64 = "0.22.1"
 rand = "0.8.5"
+futures-util = "0.3.31"
 
 [profile.release]
 opt-level = 3

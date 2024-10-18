@@ -49,6 +49,8 @@ pub struct Peer {
     pub tx_queue: VecDeque<Vec<u8>>,
     pub rx_queue: VecDeque<Vec<u8>>,
 
+    pub buf: Vec<u8>,
+
     pub notify: Arc<Notify>,
 }
 
@@ -62,21 +64,44 @@ impl Peer {
             tx_queue: VecDeque::new(),
             rx_queue: VecDeque::new(),
 
+            buf: vec![0; 8 * 1024],
+
             notify: Arc::new(Notify::new()),
         }
     }
 
     #[instrument(skip(self, sleep))]
     pub async fn poll_device(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), Error> {
-        for packet in self.tx_queue.drain(..) {
-            Self::handle_peer_tx_packet(&mut self.tunn, &self.conn, &packet).await?;
+        let Self {
+            ref mut tunn,
+            ref conn,
+            ref mut buf,
+            ref mut rx_queue,
+            ref mut tx_queue,
+            ref notify,
+            ..
+        } = self;
+
+        for packet in tx_queue.drain(..) {
+            Self::handle_peer_tx_packet(tunn, conn, buf, &packet).await?;
         }
 
-        let mut rx_buf = vec![0; 8 * 1024];
+        if !rx_queue.is_empty() {
+            notify.notify_waiters();
+        }
+
         tokio::select! {
-            read = self.conn.recv(&mut rx_buf) => {
-                let read = read?;
-                self.handle_peer_rx_packet(&rx_buf[0..read]).await?;
+            ready = self.conn.readable() => {
+                ready?;
+                loop {
+                    match conn.try_recv(buf) {
+                        Ok(read) => {
+                            Self::handle_peer_rx_packet(tunn, conn, rx_queue, notify, &buf[0..read]).await?;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
             }
             () = sleep.as_mut() => {
                 sleep.reset(Instant::now() + Duration::from_secs(1));
@@ -88,15 +113,16 @@ impl Peer {
         Ok(())
     }
 
-    #[instrument(skip(tunn, conn, packet))]
+    #[instrument(skip(tunn, conn, buf, packet))]
     pub async fn handle_peer_tx_packet(
         tunn: &mut Tunn,
         conn: &UdpSocket,
+        buf: &mut Vec<u8>,
         packet: &[u8],
     ) -> Result<(), Error> {
-        let mut out = vec![0; (packet.len() + 32).max(148)];
+        buf.reserve((packet.len() + 32).max(148));
 
-        let res = tunn.encapsulate(packet, &mut out);
+        let res = tunn.encapsulate(packet, buf);
 
         match res {
             // send to CF Warp
@@ -107,28 +133,27 @@ impl Peer {
 
                 Ok(())
             }
-            // send to clients
-            TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                unreachable!()
-            }
-            // done
-            TunnResult::Done => Ok(()),
             TunnResult::Err(e) => Err(e.into()),
+            _ => Ok(()),
         }
     }
 
-    #[instrument(skip(self, packet))]
-    pub async fn handle_peer_rx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
+    #[instrument(skip(tunn, conn, rx_queue, notify, packet))]
+    pub async fn handle_peer_rx_packet(
+        tunn: &mut Tunn,
+        conn: &UdpSocket,
+        rx_queue: &mut VecDeque<Vec<u8>>,
+        notify: &Arc<Notify>,
+        packet: &[u8],
+    ) -> Result<(), Error> {
         tracing::info!(len = packet.len(), "recieved packet peer");
 
-        let mut out = vec![0; 8 * 1024];
+        let mut out = [0; 8 * 1024];
 
         let mut result: TunnResult;
         let mut first_loop = true;
         loop {
-            result = self
-                .tunn
-                .decapsulate(None, if first_loop { packet } else { &[] }, &mut out);
+            result = tunn.decapsulate(None, if first_loop { packet } else { &[] }, &mut out);
 
             first_loop = false;
 
@@ -136,15 +161,15 @@ impl Peer {
                 TunnResult::WriteToNetwork(packet) => {
                     tracing::debug!(num_bytes = packet.len(), "writing to peer network");
 
-                    assert_eq!(self.conn.send(packet).await?, packet.len());
+                    assert_eq!(conn.send(packet).await?, packet.len());
                     continue;
                 }
 
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
                     tracing::info!("WRITE TO SMOL DEVICE");
 
-                    self.rx_queue.push_front(packet.to_vec());
-                    self.notify.notify_one();
+                    rx_queue.push_front(packet.to_vec());
+                    notify.notify_one();
 
                     break;
                 }
