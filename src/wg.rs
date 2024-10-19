@@ -50,8 +50,6 @@ pub struct Peer {
     pub rx_queue: VecDeque<Vec<u8>>,
 
     pub buf: Vec<u8>,
-
-    pub notify: Arc<Notify>,
 }
 
 impl Peer {
@@ -65,8 +63,6 @@ impl Peer {
             rx_queue: VecDeque::new(),
 
             buf: vec![0; 8 * 1024],
-
-            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -78,16 +74,11 @@ impl Peer {
             ref mut buf,
             ref mut rx_queue,
             ref mut tx_queue,
-            ref notify,
             ..
         } = self;
 
         for packet in tx_queue.drain(..) {
             Self::handle_peer_tx_packet(tunn, conn, buf, &packet).await?;
-        }
-
-        if !rx_queue.is_empty() {
-            notify.notify_waiters();
         }
 
         tokio::select! {
@@ -96,7 +87,7 @@ impl Peer {
                 loop {
                     match conn.try_recv(buf) {
                         Ok(read) => {
-                            Self::handle_peer_rx_packet(tunn, conn, rx_queue, notify, &buf[0..read]).await?;
+                            Self::handle_peer_rx_packet(tunn, conn, rx_queue, &buf[0..read]).await?;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) => return Err(e.into()),
@@ -138,12 +129,11 @@ impl Peer {
         }
     }
 
-    #[instrument(skip(tunn, conn, rx_queue, notify, packet))]
+    #[instrument(skip(tunn, conn, rx_queue, packet))]
     pub async fn handle_peer_rx_packet(
         tunn: &mut Tunn,
         conn: &UdpSocket,
         rx_queue: &mut VecDeque<Vec<u8>>,
-        notify: &Arc<Notify>,
         packet: &[u8],
     ) -> Result<(), Error> {
         tracing::info!(len = packet.len(), "recieved packet peer");
@@ -169,7 +159,6 @@ impl Peer {
                     tracing::info!("WRITE TO SMOL DEVICE");
 
                     rx_queue.push_front(packet.to_vec());
-                    notify.notify_one();
 
                     break;
                 }
