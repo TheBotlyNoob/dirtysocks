@@ -13,7 +13,7 @@ tokio = { version = "1.40.0", default-features = false, features = [
 hickory-resolver = "0.24.1"
 strum = { version = "0.26.2", features = ["derive"] }
 untrusted = "0.9.0"
-boringtun = { version = "0.6.0", git = "https://github.com/NordSecurity/boringtun?ref=0bba376" }
+boringtun = "0.6.0"
 seq-macro = "0.3.5"
 tracing = "0.1.40"
 thiserror = "1.0.64"

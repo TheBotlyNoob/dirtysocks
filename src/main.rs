@@ -47,7 +47,7 @@ async fn main() {
             StaticSecret::from(private_key),
             PublicKey::from(public_key),
             None,
-            Some(30),
+            None,
             0,
             None,
         )

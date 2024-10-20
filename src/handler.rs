@@ -141,7 +141,7 @@ pub struct Connection<State> {
     client_addr: SocketAddr,
     resolver: TokioAsyncResolver,
     timeout: Duration,
-    pub buf: Vec<u8>,
+    pub buf: Box<[u8]>,
     user_pass: Option<crate::UserPass>,
 
     _state: PhantomData<State>,
@@ -159,7 +159,7 @@ impl Connection<Initial> {
             client_addr,
             resolver,
             timeout,
-            buf: vec![0; 8 * 1024],
+            buf: Box::new([0; crate::MAX_PACKET_SIZE]),
             user_pass,
             _state: PhantomData,
         }
@@ -175,6 +175,7 @@ impl Connection<Initial> {
         self.stream
             .write_all(&[SOCKS_VERSION, method as u8])
             .await?;
+        self.stream.flush().await?;
 
         if method == AuthMethod::NoneAcceptable {
             tracing::warn!("no acceptable auth method found");
@@ -194,6 +195,7 @@ impl Connection<Initial> {
             self.stream
                 .write_all(&[USERNAME_PASSWORD_VERSION, status])
                 .await?;
+            self.stream.flush().await?;
 
             if status != 0x00 {
                 tracing::warn!("invalid credentials");
@@ -319,6 +321,7 @@ impl Connection<Authorized> {
             Reply::new(0x00, SocketAddr::from(([0, 0, 0, 0], 0))).to_bytes();
 
         self.stream.write_all(&reply_buf[..reply_buf_len]).await?;
+        self.stream.flush().await?;
 
         Ok(change_state::<_, Piping>(self))
     }

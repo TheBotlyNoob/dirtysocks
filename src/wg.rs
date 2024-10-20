@@ -7,15 +7,16 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, MutexGuard, PoisonError},
+    sync::{MutexGuard, PoisonError},
     time::Duration,
 };
 use tokio::{
     net::UdpSocket,
-    sync::Notify,
     time::{Instant, Sleep},
 };
 use tracing::instrument;
+
+use crate::MAX_PACKET_SIZE;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -49,7 +50,7 @@ pub struct Peer {
     pub tx_queue: VecDeque<Vec<u8>>,
     pub rx_queue: VecDeque<Vec<u8>>,
 
-    pub buf: Vec<u8>,
+    pub buf: Box<[u8]>,
 }
 
 impl Peer {
@@ -62,7 +63,7 @@ impl Peer {
             tx_queue: VecDeque::new(),
             rx_queue: VecDeque::new(),
 
-            buf: vec![0; 8 * 1024],
+            buf: Box::new([0; MAX_PACKET_SIZE]),
         }
     }
 
@@ -72,7 +73,6 @@ impl Peer {
             ref mut tunn,
             ref conn,
             ref mut buf,
-            ref mut rx_queue,
             ref mut tx_queue,
             ..
         } = self;
@@ -81,21 +81,16 @@ impl Peer {
             Self::handle_peer_tx_packet(tunn, conn, buf, &packet).await?;
         }
 
+        let mut rx_buf = Box::new([0; MAX_PACKET_SIZE]);
+
         tokio::select! {
-            ready = self.conn.readable() => {
-                ready?;
-                loop {
-                    match conn.try_recv(buf) {
-                        Ok(read) => {
-                            Self::handle_peer_rx_packet(tunn, conn, rx_queue, &buf[0..read]).await?;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(e) => return Err(e.into()),
-                    }
-                }
+            ready = conn.recv(&mut *rx_buf) => {
+                let len = ready?;
+
+                self.handle_peer_rx_packet(&rx_buf[..len]).await?;
             }
             () = sleep.as_mut() => {
-                sleep.reset(Instant::now() + Duration::from_secs(1));
+                sleep.reset(Instant::now() + Duration::from_millis(250));
 
                 self.update_timers(&mut [0; 148]).await.unwrap();
             }
@@ -108,11 +103,9 @@ impl Peer {
     pub async fn handle_peer_tx_packet(
         tunn: &mut Tunn,
         conn: &UdpSocket,
-        buf: &mut Vec<u8>,
+        buf: &mut [u8],
         packet: &[u8],
     ) -> Result<(), Error> {
-        buf.reserve((packet.len() + 32).max(148));
-
         let res = tunn.encapsulate(packet, buf);
 
         match res {
@@ -129,21 +122,16 @@ impl Peer {
         }
     }
 
-    #[instrument(skip(tunn, conn, rx_queue, packet))]
-    pub async fn handle_peer_rx_packet(
-        tunn: &mut Tunn,
-        conn: &UdpSocket,
-        rx_queue: &mut VecDeque<Vec<u8>>,
-        packet: &[u8],
-    ) -> Result<(), Error> {
+    #[instrument(skip(self, packet))]
+    pub async fn handle_peer_rx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
         tracing::info!(len = packet.len(), "recieved packet peer");
-
-        let mut out = [0; 8 * 1024];
 
         let mut result: TunnResult;
         let mut first_loop = true;
         loop {
-            result = tunn.decapsulate(None, if first_loop { packet } else { &[] }, &mut out);
+            result =
+                self.tunn
+                    .decapsulate(None, if first_loop { packet } else { &[] }, &mut self.buf);
 
             first_loop = false;
 
@@ -151,14 +139,15 @@ impl Peer {
                 TunnResult::WriteToNetwork(packet) => {
                     tracing::debug!(num_bytes = packet.len(), "writing to peer network");
 
-                    assert_eq!(conn.send(packet).await?, packet.len());
+                    assert_eq!(self.conn.send(packet).await?, packet.len());
+
                     continue;
                 }
 
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
                     tracing::info!("WRITE TO SMOL DEVICE");
 
-                    rx_queue.push_front(packet.to_vec());
+                    self.rx_queue.push_front(packet.to_vec());
 
                     break;
                 }
@@ -186,7 +175,7 @@ impl Peer {
                 Ok(())
             }
 
-            TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+            TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
                 unreachable!()
             }
 
@@ -267,7 +256,7 @@ impl Device for Peer {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ip;
-        capabilities.max_transmission_unit = 1500;
+        capabilities.max_transmission_unit = 1280;
         capabilities
     }
 }
