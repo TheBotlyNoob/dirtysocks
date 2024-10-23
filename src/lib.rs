@@ -36,7 +36,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
     sync::mpsc::{Receiver, Sender},
+    time::Instant as TokioInstant,
 };
+use tracing::instrument;
 
 pub mod wg;
 use wg::Peer;
@@ -202,6 +204,7 @@ impl Server {
         }
     }
 
+    #[instrument(skip(sender, conn))]
     async fn handle_conn(sender: Sender<ToWgMsg>, conn: Connection<Initial>) -> Result<(), Error> {
         let (socket_tx, mut socket_rx) = tokio::sync::mpsc::channel(128);
 
@@ -220,13 +223,28 @@ impl Server {
 
         tracing::info!(handle = ?handle, "allocated handle");
 
+        let mut recvd_len = 0;
+        let mut flush_next = None;
+
         loop {
             tokio::select! {
                 Some(msg) = socket_rx.recv() => {
                     match msg {
                         FromWgMsg::Data(data) => {
-                            pipe.stream.write_all(&data).await?;
-                            pipe.stream.flush().await?;
+                            tracing::info!(data_len = data.len(), "sending data to remote");
+
+                            pipe.buf[recvd_len..recvd_len + data.len()].copy_from_slice(&data);
+                            recvd_len += data.len();
+
+                            if recvd_len >= 8 * 1024 {
+                                tracing::warn!("buffer full, flushing");
+
+                                pipe.stream.flush().await?;
+                                recvd_len = 0;
+                                flush_next = None;
+                            } else {
+                                flush_next = Some(TokioInstant::now() + StdDuration::from_millis(100));
+                            }
                         },
                         FromWgMsg::Close => break,
                         FromWgMsg::Connect(_) => {
@@ -234,7 +252,7 @@ impl Server {
                         },
                     }
                 }
-                read = pipe.stream.read(&mut pipe.buf) => {
+                read = pipe.stream.read(&mut pipe.buf[recvd_len..]) => {
                     let Ok(read) = read else {
                         tracing::warn!("error reading from stream");
                         break;
@@ -250,7 +268,7 @@ impl Server {
                     sender.send(
                         ToWgMsg::Data(
                             handle,
-                            pipe.buf[..read]
+                            pipe.buf[recvd_len..recvd_len + read]
                                 .to_vec()
                                 .into_boxed_slice()
                         )
@@ -258,8 +276,16 @@ impl Server {
                     .await
                     .unwrap();
                 }
-                else => {
-                    break;
+                () = flush_next.map_or_else(
+                    || Either::Left(std::future::pending()),
+                    |next| Either::Right(tokio::time::sleep_until(next))
+                ) => {
+                    tracing::warn!("flushing buffer");
+
+                    pipe.stream.write_all(&pipe.buf[..recvd_len]).await?;
+                    pipe.stream.flush().await?;
+                    recvd_len = 0;
+                    flush_next = None;
                 }
             }
         }
@@ -274,7 +300,6 @@ impl Server {
 struct SocketCtx {
     sender: Sender<FromWgMsg>,
     send_queue: Vec<Box<[u8]>>,
-    polls_without_recv: u8,
 }
 
 pub struct IfaceHandler {
@@ -292,25 +317,32 @@ impl IfaceHandler {
     pub async fn handle_iface(mut self) {
         let mut needs_poll = false;
 
+        let mut pre_process_sockets = false;
+
         let mut last_device_poll = pin!(tokio::time::sleep(StdDuration::ZERO));
+        let mut device_buf = Box::new([0; MAX_PACKET_SIZE]);
 
         loop {
             if needs_poll {
-                self.poll_iface().await;
+                tracing::info!("needs a poll");
+                self.poll_iface(pre_process_sockets).await;
                 needs_poll = false;
+                pre_process_sockets = false;
             }
 
             tokio::select! {
                 Some(msg) = self.socket_rx.recv() => {
                     self.handle_msg(msg).await;
                     needs_poll = true;
+                    pre_process_sockets = true;
                 },
 
-                e = self.peer.poll_device(last_device_poll.as_mut()) => {
+                e = self.peer.poll_device(last_device_poll.as_mut(), &mut *device_buf) => {
                     if let Err(e) = e {
                         tracing::warn!(?e, "error polling device");
                     }
                     needs_poll |= !self.peer.rx_queue.is_empty();
+                    needs_poll = true;
                 },
 
                 () = Self::wait_for_poll_iface(self.last_iface_poll, self.iface_poll_delay) => {
@@ -320,7 +352,11 @@ impl IfaceHandler {
         }
     }
 
-    async fn poll_iface(&mut self) {
+    async fn poll_iface(&mut self, pre_process_sockets: bool) {
+        if pre_process_sockets {
+            self.poll_sockets().await;
+        }
+
         self.last_iface_poll = StdInstant::now();
         let smoltcp_now = SmolInstant::from(self.last_iface_poll);
 
@@ -337,24 +373,26 @@ impl IfaceHandler {
         self.iface_poll_delay = delay;
 
         if processed {
-            for handle in self.poll_sockets().await.into_iter().flatten() {
-                tracing::info!(handle = ?handle, "socket closed");
-                self.sockets_ctx.remove(&handle);
-                self.socket_set.remove(handle);
-            }
+            self.poll_sockets().await;
         }
     }
 
-    fn poll_sockets(&mut self) -> JoinAll<impl Future<Output = Option<SocketHandle>>> {
+    async fn poll_sockets(&mut self) {
         tracing::info!("polling sockets");
 
-        join_all(self.socket_set.iter_mut().map(|(handle, socket)| {
+        let joined = join_all(self.socket_set.iter_mut().map(|(handle, socket)| {
             Self::poll_socket(
                 handle,
                 tcp::Socket::downcast_mut(socket).unwrap(),
                 self.sockets_ctx.get_mut(&handle).unwrap(),
             )
-        }))
+        }));
+
+        for handle in joined.await.into_iter().flatten() {
+            tracing::info!(handle = ?handle, "socket closed");
+            self.sockets_ctx.remove(&handle);
+            self.socket_set.remove(handle);
+        }
     }
 
     fn poll_socket(
@@ -365,28 +403,17 @@ impl IfaceHandler {
         let mut messages = [None, None];
 
         if socket.can_recv() {
-            tracing::info!(handle = ?handle, polls = ctx.polls_without_recv, queue_size = socket.recv_queue(), "socket can recv");
+            tracing::info!(handle = ?handle,  queue_size = socket.recv_queue(), "socket can recv");
+            socket
+                .recv(|buf| {
+                    tracing::info!(handle = ?handle, read = buf.len(), "read data from socket");
+                    let data = buf.to_vec().into_boxed_slice();
 
-            if socket.recv_queue() >= 8 * 1024 || ctx.polls_without_recv >= 10 {
-                tracing::info!(handle = ?handle, queue_size = socket.recv_queue(), "socket recv flushing");
+                    messages[0] = Some(FromWgMsg::Data(data));
 
-                socket
-                    .recv(|buf| {
-                        tracing::info!(handle = ?handle, read = buf.len(), "read data from socket");
-                        let data = buf.to_vec().into_boxed_slice();
-
-                        messages[0] = Some(FromWgMsg::Data(data));
-
-                        (buf.len(), ())
-                    })
-                    .unwrap();
-
-                ctx.polls_without_recv = 0;
-            } else {
-                ctx.polls_without_recv += 1;
-            }
-        } else {
-            ctx.polls_without_recv += 1;
+                    (buf.len(), ())
+                })
+                .unwrap();
         }
 
         if socket.can_send() {
@@ -466,7 +493,6 @@ impl IfaceHandler {
                     SocketCtx {
                         sender,
                         send_queue: Vec::new(),
-                        polls_without_recv: 0,
                     },
                 );
             }
@@ -509,7 +535,7 @@ impl IfaceHandler {
             Some(delay) => {
                 let wait_dur = StdDuration::from_micros(delay.total_micros());
                 let next_wake = now + wait_dur;
-                tracing::warn!(next_wake_ms = wait_dur.as_millis(), elapsed = ?std::time::Instant::now().saturating_duration_since(now), "polling iface");
+                tracing::warn!(next_wake_ms = wait_dur.as_millis(), elapsed = ?std::time::Instant::now().saturating_duration_since(now), "will poll iface");
 
                 Either::Right(tokio::time::sleep_until(tokio::time::Instant::from_std(
                     next_wake,

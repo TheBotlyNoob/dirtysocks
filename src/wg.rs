@@ -67,8 +67,12 @@ impl Peer {
         }
     }
 
-    #[instrument(skip(self, sleep))]
-    pub async fn poll_device(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), Error> {
+    #[instrument(skip(self, sleep, recv_buf))]
+    pub async fn poll_device(
+        &mut self,
+        mut sleep: Pin<&mut Sleep>,
+        recv_buf: &mut [u8],
+    ) -> Result<(), Error> {
         let Self {
             ref mut tunn,
             ref conn,
@@ -77,22 +81,22 @@ impl Peer {
             ..
         } = self;
 
+        tracing::info!("waiting for device");
+
         for packet in tx_queue.drain(..) {
             Self::handle_peer_tx_packet(tunn, conn, buf, &packet).await?;
         }
 
-        let mut rx_buf = Box::new([0; MAX_PACKET_SIZE]);
-
         tokio::select! {
-            ready = conn.recv(&mut *rx_buf) => {
+            ready = conn.recv(recv_buf) => {
                 let len = ready?;
 
-                self.handle_peer_rx_packet(&rx_buf[..len]).await?;
+                self.handle_peer_rx_packet(&recv_buf[..len]).await?;
             }
             () = sleep.as_mut() => {
                 sleep.reset(Instant::now() + Duration::from_millis(250));
 
-                self.update_timers(&mut [0; 148]).await.unwrap();
+                self.update_timers(recv_buf).await.unwrap();
             }
         }
 
@@ -147,7 +151,7 @@ impl Peer {
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
                     tracing::info!("WRITE TO SMOL DEVICE");
 
-                    self.rx_queue.push_front(packet.to_vec());
+                    self.rx_queue.push_back(packet.to_vec());
 
                     break;
                 }
