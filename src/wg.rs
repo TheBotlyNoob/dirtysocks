@@ -1,4 +1,5 @@
 use boringtun::noise::{errors::WireGuardError, Tunn, TunnResult};
+use futures_util::FutureExt;
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     wire::{Ipv4Packet, PrettyPrinter},
@@ -50,6 +51,9 @@ pub struct Peer {
     pub tx_queue: VecDeque<Vec<u8>>,
     pub rx_queue: VecDeque<Vec<u8>>,
 
+    pub needs_final_dispatch: bool,
+    pub should_poll: bool,
+
     pub buf: Box<[u8]>,
 }
 
@@ -63,6 +67,9 @@ impl Peer {
             tx_queue: VecDeque::new(),
             rx_queue: VecDeque::new(),
 
+            needs_final_dispatch: false,
+            should_poll: false,
+
             buf: Box::new([0; MAX_PACKET_SIZE]),
         }
     }
@@ -73,25 +80,38 @@ impl Peer {
         mut sleep: Pin<&mut Sleep>,
         recv_buf: &mut [u8],
     ) -> Result<(), Error> {
-        let Self {
-            ref mut tunn,
-            ref conn,
-            ref mut buf,
-            ref mut tx_queue,
-            ..
-        } = self;
-
         tracing::info!("waiting for device");
 
-        for packet in tx_queue.drain(..) {
-            Self::handle_peer_tx_packet(tunn, conn, buf, &packet).await?;
+        while let Some(packet) = self.tx_queue.pop_back() {
+            self.handle_peer_tx_packet(&packet).await?;
+            self.should_poll = true;
+        }
+
+        while dbg!(self.needs_final_dispatch) {
+            self.handle_peer_rx_packet(&[]).await?;
         }
 
         tokio::select! {
-            ready = conn.recv(recv_buf) => {
-                let len = ready?;
+            ready = self.conn.readable() => {
+                ready?;
 
-                self.handle_peer_rx_packet(&recv_buf[..len]).await?;
+                loop {
+                    match self.conn.try_recv(recv_buf) {
+                        Ok(len) => {
+                            self.handle_peer_rx_packet(&recv_buf[..len]).await?;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, "failed to read from socket");
+                        }
+                    }
+                }
+
+                while dbg!(self.needs_final_dispatch) {
+                    self.handle_peer_rx_packet(&[]).await?;
+                }
             }
             () = sleep.as_mut() => {
                 sleep.reset(Instant::now() + Duration::from_millis(250));
@@ -103,21 +123,19 @@ impl Peer {
         Ok(())
     }
 
-    #[instrument(skip(tunn, conn, buf, packet))]
-    pub async fn handle_peer_tx_packet(
-        tunn: &mut Tunn,
-        conn: &UdpSocket,
-        buf: &mut [u8],
-        packet: &[u8],
-    ) -> Result<(), Error> {
-        let res = tunn.encapsulate(packet, buf);
+    #[instrument(skip(self, packet))]
+    pub async fn handle_peer_tx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
+        let res = self.tunn.encapsulate(packet, &mut self.buf);
 
         match res {
             // send to CF Warp
             TunnResult::WriteToNetwork(packet) => {
                 tracing::debug!(num_bytes = packet.len(), "writing to peer network");
 
-                assert_eq!(conn.send(packet).await?, packet.len());
+                assert_eq!(
+                    self.conn.send(packet).now_or_never().unwrap().unwrap(),
+                    packet.len()
+                );
 
                 Ok(())
             }
@@ -130,38 +148,33 @@ impl Peer {
     pub async fn handle_peer_rx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
         tracing::info!(len = packet.len(), "recieved packet peer");
 
-        let mut result: TunnResult;
-        let mut first_loop = true;
-        loop {
-            result =
-                self.tunn
-                    .decapsulate(None, if first_loop { packet } else { &[] }, &mut self.buf);
+        let result = self.tunn.decapsulate(None, packet, &mut self.buf);
 
-            first_loop = false;
+        match result {
+            TunnResult::WriteToNetwork(packet) => {
+                tracing::debug!(num_bytes = packet.len(), "writing to peer network");
 
-            match result {
-                TunnResult::WriteToNetwork(packet) => {
-                    tracing::debug!(num_bytes = packet.len(), "writing to peer network");
+                assert_eq!(self.conn.send(packet).await?, packet.len());
+                self.needs_final_dispatch = true;
 
-                    assert_eq!(self.conn.send(packet).await?, packet.len());
-
-                    continue;
-                }
-
-                TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                    tracing::info!("WRITE TO SMOL DEVICE");
-
-                    self.rx_queue.push_back(packet.to_vec());
-
-                    break;
-                }
-
-                TunnResult::Done => break,
-                TunnResult::Err(e) => return Err(e.into()),
+                Ok(())
             }
-        }
 
-        Ok(())
+            TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                tracing::info!("WRITE TO SMOL DEVICE");
+
+                self.rx_queue.push_front(packet.to_vec());
+                self.should_poll = true;
+
+                Ok(())
+            }
+
+            TunnResult::Done => {
+                self.needs_final_dispatch = false;
+                Ok(())
+            }
+            TunnResult::Err(e) => Err(e.into()),
+        }
     }
 
     /// Must be called often.
