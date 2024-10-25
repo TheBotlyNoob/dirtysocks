@@ -15,6 +15,7 @@ use futures_util::{
 use handler::{Connection, Initial};
 use hickory_resolver::TokioAsyncResolver;
 use smoltcp::{
+    config::IFACE_MAX_ADDR_COUNT,
     iface::{self, Config, SocketHandle, SocketSet},
     socket::{
         tcp::{self, SocketBuffer},
@@ -27,7 +28,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU16,
     pin::pin,
     time::{Duration as StdDuration, Instant as StdInstant},
@@ -124,7 +125,7 @@ impl Server {
         resolver: TokioAsyncResolver,
         timeout: StdDuration,
         user_pass: Option<UserPass>,
-        iface_addr: IpAddr,
+        iface_addrs: heapless::Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
     ) -> Result<Self, Error> {
         let peer_conn = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
         peer_conn.connect(endpoint_addr).await?;
@@ -136,11 +137,7 @@ impl Server {
 
         let mut iface = iface::Interface::new(iface_conf, &mut peer, SmolInstant::now());
 
-        iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs
-                .push(IpCidr::new(IpAddress::from(iface_addr), 32))
-                .unwrap();
-        });
+        iface.update_ip_addrs(|ip_addrs| *ip_addrs = iface_addrs);
 
         let (socket_tx, socket_rx) = tokio::sync::mpsc::channel(128);
 
@@ -217,8 +214,8 @@ impl Server {
             .await
             .unwrap();
 
-        let FromWgMsg::Connect(handle) = socket_rx.recv().await.unwrap() else {
-            unreachable!();
+        let Some(FromWgMsg::Connect(handle)) = socket_rx.recv().await else {
+            return Err(Error::UnexpectedEOI);
         };
 
         tracing::info!(handle = ?handle, "allocated handle");
@@ -291,7 +288,7 @@ impl Server {
             }
         }
 
-        sender.send(ToWgMsg::Close(handle)).await.unwrap();
+        let _ = sender.send(ToWgMsg::Close(handle)).await;
         pipe.stream.shutdown().await?;
 
         Ok(())

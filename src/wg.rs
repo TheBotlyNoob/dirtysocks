@@ -87,7 +87,7 @@ impl Peer {
             self.should_poll = true;
         }
 
-        while dbg!(self.needs_final_dispatch) {
+        while self.needs_final_dispatch {
             self.handle_peer_rx_packet(&[]).await?;
         }
 
@@ -109,7 +109,7 @@ impl Peer {
                     }
                 }
 
-                while dbg!(self.needs_final_dispatch) {
+                while self.needs_final_dispatch {
                     self.handle_peer_rx_packet(&[]).await?;
                 }
             }
@@ -132,10 +132,7 @@ impl Peer {
             TunnResult::WriteToNetwork(packet) => {
                 tracing::debug!(num_bytes = packet.len(), "writing to peer network");
 
-                assert_eq!(
-                    self.conn.send(packet).now_or_never().unwrap().unwrap(),
-                    packet.len()
-                );
+                assert_eq!(self.conn.send(packet).await.unwrap(), packet.len());
 
                 Ok(())
             }

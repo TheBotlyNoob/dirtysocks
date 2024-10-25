@@ -305,6 +305,7 @@ dependencies = [
  "base64 0.22.1",
  "boringtun",
  "futures-util",
+ "heapless",
  "hickory-resolver",
  "rand",
  "seq-macro",
