@@ -1,5 +1,4 @@
 use boringtun::noise::{errors::WireGuardError, Tunn, TunnResult};
-use futures_util::FutureExt;
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     wire::{Ipv4Packet, PrettyPrinter},
@@ -80,8 +79,6 @@ impl Peer {
         mut sleep: Pin<&mut Sleep>,
         recv_buf: &mut [u8],
     ) -> Result<(), Error> {
-        tracing::info!("waiting for device");
-
         while let Some(packet) = self.tx_queue.pop_back() {
             self.handle_peer_tx_packet(&packet).await?;
             self.should_poll = true;
@@ -130,7 +127,7 @@ impl Peer {
         match res {
             // send to CF Warp
             TunnResult::WriteToNetwork(packet) => {
-                tracing::debug!(num_bytes = packet.len(), "writing to peer network");
+                tracing::trace!(num_bytes = packet.len(), "writing to peer network");
 
                 assert_eq!(self.conn.send(packet).await.unwrap(), packet.len());
 
@@ -143,13 +140,13 @@ impl Peer {
 
     #[instrument(skip(self, packet))]
     pub async fn handle_peer_rx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
-        tracing::info!(len = packet.len(), "recieved packet peer");
+        tracing::trace!(len = packet.len(), "recieved packet peer");
 
         let result = self.tunn.decapsulate(None, packet, &mut self.buf);
 
         match result {
             TunnResult::WriteToNetwork(packet) => {
-                tracing::debug!(num_bytes = packet.len(), "writing to peer network");
+                tracing::trace!(num_bytes = packet.len(), "writing to peer network");
 
                 assert_eq!(self.conn.send(packet).await?, packet.len());
                 self.needs_final_dispatch = true;
@@ -158,7 +155,7 @@ impl Peer {
             }
 
             TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                tracing::info!("WRITE TO SMOL DEVICE");
+                tracing::trace!("WRITE TO SMOL DEVICE");
 
                 self.rx_queue.push_front(packet.to_vec());
                 self.should_poll = true;
@@ -182,7 +179,7 @@ impl Peer {
         let res = self.tunn.update_timers(buf);
         match res {
             TunnResult::WriteToNetwork(packet) => {
-                tracing::debug!(num_bytes = packet.len(), "writing to peer network");
+                tracing::trace!(num_bytes = packet.len(), "writing to peer network");
 
                 assert_eq!(self.conn.send(packet).await?, packet.len());
 
@@ -208,7 +205,7 @@ impl RxToken for WgRxToken {
     {
         match Ipv4Packet::new_checked(&*self.packet) {
             Ok(parsed) => {
-                tracing::info!(info = %PrettyPrinter::<Ipv4Packet<&[u8]>>::print(&parsed), "PACKET FROM PEER");
+                tracing::trace!(info = %PrettyPrinter::<Ipv4Packet<&[u8]>>::print(&parsed), "PACKET FROM PEER");
             }
             Err(e) => tracing::warn!(?e, "failed parsing packet"),
         }
@@ -225,7 +222,7 @@ impl<'a> TxToken for WgTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        tracing::debug!(?len, "transfer token consumed");
+        tracing::trace!(?len, "transfer token consumed");
         let mut packet = vec![0; len];
 
         let ret = f(&mut packet);
@@ -245,7 +242,7 @@ impl Device for Peer {
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if let Some(packet) = self.rx_queue.pop_back() {
-            tracing::info!(
+            tracing::trace!(
                 len = packet.len(),
                 "recieved packet from peer; recv token retrieved"
             );
@@ -261,7 +258,7 @@ impl Device for Peer {
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        tracing::warn!("trans TOKEN");
+        tracing::trace!("trans TOKEN");
         Some(WgTxToken {
             tx: &mut self.tx_queue,
         })
