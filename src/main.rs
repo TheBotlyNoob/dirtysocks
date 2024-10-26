@@ -1,5 +1,6 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    str::FromStr,
     time::Duration,
 };
 
@@ -12,6 +13,7 @@ use hickory_resolver::{
     config::{ResolverConfig, ResolverOpts},
     TokioAsyncResolver,
 };
+use smoltcp::wire::{IpCidr, Ipv4Cidr, Ipv6Cidr};
 use tokio::net::TcpListener;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -25,6 +27,9 @@ async fn main() {
                 .from_env_lossy(),
         )
         .init();
+
+    // taken from wgcf-profile.conf
+    // I don't feel like parsing it in this example.
 
     let mut private_key = [0; 32];
     base64::engine::general_purpose::STANDARD
@@ -56,7 +61,16 @@ async fn main() {
         TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default()),
         Duration::from_secs(20),
         None,
-        IpAddr::V4(Ipv4Addr::new(172, 16, 0, 2)),
+        heapless::Vec::from_slice(&[
+            IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Addr::new(172, 16, 0, 2).into(), 32)),
+            IpCidr::Ipv6(Ipv6Cidr::new(
+                Ipv6Addr::from_str("2606:4700:110:8a92:f108:c887:d02e:1b61")
+                    .unwrap()
+                    .into(),
+                128,
+            )),
+        ])
+        .unwrap(),
     )
     .await
     .unwrap()
