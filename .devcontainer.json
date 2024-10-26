@@ -13,9 +13,7 @@
     "--cap-add=PERFMON",
     "--security-opt",
     "seccomp=unconfined",
-    "--cap-add=NET_ADMIN",
-    "--privileged",
-    "--net=host"
+    "--privileged"
   ],
   "image": "ghcr.io/cachix/devenv:latest",
   "overrideCommand": false,
