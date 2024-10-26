@@ -10,6 +10,9 @@
   # scripts.hello.exec = "echo hello from $GREET";
   # https://devenv.sh/services/
   languages.rust.enable = true;
+
+  devcontainer.enable = true;
+  
   # https://devenv.sh/languages/
   # languages.nix.enable = true;
 
