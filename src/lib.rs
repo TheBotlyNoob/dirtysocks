@@ -25,7 +25,7 @@ use smoltcp::{
     wire::{HardwareAddress, IpAddress, IpCidr},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     future::Future,
     net::SocketAddr,
@@ -223,6 +223,8 @@ impl Server {
         let mut recvd_len = 0;
         let mut flush_next = None;
 
+        let mut chunks = VecDeque::with_capacity(64);
+
         loop {
             tokio::select! {
                 Some(msg) = socket_rx.recv() => {
@@ -230,26 +232,19 @@ impl Server {
                         FromWgMsg::Data(data) => {
                             tracing::trace!(data_len = data.len(), "sending data to remote");
 
-                            if recvd_len + data.len() > pipe.buf.len() {
-                                tracing::trace!("flushing buf");
-
-                                pipe.stream.write_all(&pipe.buf[..recvd_len]).await?;
-                                pipe.stream.flush().await?;
-                                recvd_len = 0;
-                            }
-
-                            pipe.buf[recvd_len..recvd_len + data.len()].copy_from_slice(&data);
                             recvd_len += data.len();
+                            chunks.push_front(data);
 
                             if recvd_len >= 32 * 1024 {
                                 tracing::trace!("flushing buf");
 
-                                pipe.stream.write_all(&pipe.buf[..recvd_len]).await?;
-                                pipe.stream.flush().await?;
+                                while let Some(chunk) = chunks.pop_back() {
+                                    pipe.stream.write_all(&chunk).await?;
+                                }
                                 recvd_len = 0;
                                 flush_next = None;
                             } else {
-                                flush_next = Some(TokioInstant::now() + StdDuration::from_millis(50));
+                                flush_next = Some(TokioInstant::now() + StdDuration::from_millis(100));
                             }
                         },
                         FromWgMsg::Close => break,
@@ -258,7 +253,7 @@ impl Server {
                         },
                     }
                 }
-                read = pipe.stream.read(&mut pipe.buf[recvd_len..]) => {
+                read = pipe.stream.read(&mut pipe.buf) => {
                     let Ok(read) = read else {
                         tracing::warn!("error reading from stream");
                         break;
@@ -274,9 +269,7 @@ impl Server {
                     sender.send(
                         ToWgMsg::Data(
                             handle,
-                            pipe.buf[recvd_len..recvd_len + read]
-                                .to_vec()
-                                .into_boxed_slice()
+                            pipe.buf[..read].to_vec().into_boxed_slice()
                         )
                     )
                     .await
@@ -288,8 +281,9 @@ impl Server {
                 ) => {
                     tracing::warn!("flushing buffer");
 
-                    pipe.stream.write_all(&pipe.buf[..recvd_len]).await?;
-                    pipe.stream.flush().await?;
+                    while let Some(chunk) = chunks.pop_back() {
+                        pipe.stream.write_all(&chunk).await?;
+                    }
                     recvd_len = 0;
                     flush_next = None;
                 }
@@ -498,20 +492,20 @@ impl IfaceHandler {
                 );
             }
             ToWgMsg::Data(handle, data) => {
-                let socket = self.socket_set.get_mut::<tcp::Socket>(handle);
+                if let Some(ctx) = self.sockets_ctx.get_mut(&handle) {
+                    let socket = self.socket_set.get_mut::<tcp::Socket>(handle);
 
-                if socket.can_send() {
-                    tracing::trace!(handle = ?handle, data_len = data.len(), "socket can send");
+                    if socket.can_send() {
+                        tracing::trace!(handle = ?handle, data_len = data.len(), "socket can send");
 
-                    socket.send_slice(&data).unwrap();
+                        socket.send_slice(&data).unwrap();
+                    } else {
+                        tracing::trace!(handle = ?handle, "socket can't send, queueing data");
+
+                        ctx.send_queue.push(data);
+                    }
                 } else {
-                    tracing::trace!(handle = ?handle, "socket can't send, queueing data");
-
-                    self.sockets_ctx
-                        .get_mut(&handle)
-                        .unwrap()
-                        .send_queue
-                        .push(data);
+                    tracing::warn!(handle = ?handle, "socket not found");
                 }
             }
             ToWgMsg::Close(handle) => {
