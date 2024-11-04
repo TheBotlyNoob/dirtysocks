@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 base64 = "0.22.1"
-dirtysocks = { path = "../" }
+dirtysocks = { path = "../dirtysocks" }
 clap = { version = "4.5.20", features = ["derive"] }
 tracing = "0.1.40"
 smoltcp = "0.11.0"
