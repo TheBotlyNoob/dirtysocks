@@ -6,16 +6,6 @@
       ]
     }
   },
-  "capAdd": ["SYS_PTRACE", "PERFMON"],
-
-  "runArgs": [
-    "--cap-add=SYS_PTRACE",
-    "--cap-add=PERFMON",
-    "--cap-add=SYS_ADMIN",
-    "--security-opt",
-    "seccomp=unconfined",
-    "--privileged"
-  ],
   "image": "ghcr.io/cachix/devenv:latest",
   "overrideCommand": false,
   "updateContentCommand": "devenv test"

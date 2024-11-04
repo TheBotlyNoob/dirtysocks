@@ -47,6 +47,8 @@ pub struct Peer {
     pub addr: SocketAddr,
     pub conn: UdpSocket,
 
+    pub mtu: usize,
+
     pub tx_queue: VecDeque<Vec<u8>>,
     pub rx_queue: VecDeque<Vec<u8>>,
 
@@ -57,11 +59,12 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub fn new(tunn: Tunn, addr: SocketAddr, conn: UdpSocket) -> Self {
+    pub fn new(tunn: Tunn, addr: SocketAddr, conn: UdpSocket, mtu: usize) -> Self {
         Self {
             tunn,
             addr,
             conn,
+            mtu,
 
             tx_queue: VecDeque::new(),
             rx_queue: VecDeque::new(),
@@ -267,7 +270,7 @@ impl Device for Peer {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ip;
-        capabilities.max_transmission_unit = 1280;
+        capabilities.max_transmission_unit = self.mtu;
         capabilities
     }
 }

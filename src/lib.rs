@@ -13,7 +13,10 @@ use futures_util::{
     FutureExt, StreamExt,
 };
 use handler::{Connection, Initial};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::{
+    config::{ResolverConfig, ResolverOpts},
+    TokioAsyncResolver,
+};
 use smoltcp::{
     config::IFACE_MAX_ADDR_COUNT,
     iface::{self, Config, SocketHandle, SocketSet},
@@ -103,6 +106,40 @@ enum FromWgMsg {
     Close,
 }
 
+pub struct ServerOptions {
+    pub listener: TcpListener,
+    pub tunn: Tunn,
+    /// The address of the wireguard server.
+    pub endpoint_addr: SocketAddr,
+    pub max_transmission_unit: usize,
+    pub resolver: TokioAsyncResolver,
+    pub timeout: StdDuration,
+    pub user_pass: Option<UserPass>,
+    pub iface_addrs: heapless::Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
+}
+impl ServerOptions {
+    pub fn new(
+        listener: TcpListener,
+        endpoint_addr: SocketAddr,
+        tunn: Tunn,
+        iface_addrs: heapless::Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
+    ) -> Self {
+        Self {
+            listener,
+            endpoint_addr,
+            tunn,
+            iface_addrs,
+            resolver: TokioAsyncResolver::tokio(
+                ResolverConfig::cloudflare(),
+                ResolverOpts::default(),
+            ),
+            timeout: StdDuration::from_secs(30),
+            user_pass: None,
+            max_transmission_unit: 1280,
+        }
+    }
+}
+
 /// A socks5 server implementation, sending data to a single `WireGuard` peer.
 pub struct Server {
     pub listener: TcpListener,
@@ -117,32 +154,28 @@ pub struct Server {
 
 // TODO: reuse sockets
 impl Server {
-    // TODO: use builder for this
-    pub async fn new(
-        listener: TcpListener,
-        tunn: Tunn,
-        endpoint_addr: SocketAddr,
-        resolver: TokioAsyncResolver,
-        timeout: StdDuration,
-        user_pass: Option<UserPass>,
-        iface_addrs: heapless::Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
-    ) -> Result<Self, Error> {
+    pub async fn listen(opts: ServerOptions) -> Result<Infallible, Error> {
         let peer_conn = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
-        peer_conn.connect(endpoint_addr).await?;
+        peer_conn.connect(opts.endpoint_addr).await?;
 
-        let mut peer = Peer::new(tunn, endpoint_addr, peer_conn);
+        let mut peer = Peer::new(
+            opts.tunn,
+            opts.endpoint_addr,
+            peer_conn,
+            opts.max_transmission_unit,
+        );
 
         let mut iface_conf = Config::new(HardwareAddress::Ip);
         iface_conf.random_seed = rand::random();
 
         let mut iface = iface::Interface::new(iface_conf, &mut peer, SmolInstant::now());
 
-        iface.update_ip_addrs(|ip_addrs| *ip_addrs = iface_addrs);
+        iface.update_ip_addrs(|ip_addrs| *ip_addrs = opts.iface_addrs);
 
         let (socket_tx, socket_rx) = tokio::sync::mpsc::channel(128);
 
-        Ok(Self {
-            listener,
+        let this = Self {
+            listener: opts.listener,
             iface: Some(IfaceHandler {
                 socket_rx,
                 iface,
@@ -154,15 +187,16 @@ impl Server {
                 iface_poll_delay: None,
             }),
             socket_tx,
-            resolver,
-            timeout,
-            user_pass,
+            resolver: opts.resolver,
+            timeout: opts.timeout,
+            user_pass: opts.user_pass,
             next_ephemeral_port: 1,
-        })
+        };
+
+        this.listen_().await
     }
 
-    #[allow(clippy::redundant_pub_crate)]
-    pub async fn listen(mut self) -> Result<Infallible, Error> {
+    async fn listen_(mut self) -> Result<Infallible, Error> {
         tracing::info!("SOCKS5 server started");
         if self.user_pass.is_some() {
             tracing::info!("using username/password authentication");
