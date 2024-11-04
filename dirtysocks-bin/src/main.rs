@@ -10,7 +10,7 @@ use boringtun::{
 };
 use dirtysocks::ServerOptions;
 use hickory_resolver::{
-    config::{ResolverConfig, ResolverOpts},
+    config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     TokioAsyncResolver,
 };
 use tokio::net::TcpListener;
@@ -46,7 +46,12 @@ async fn main() -> Result<()> {
         panic!("only one peer is allowed")
     };
 
-    let resolver = TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default());
+    let mut resolver_conf = ResolverConfig::new();
+    resolver_conf.add_name_server(NameServerConfig::new(
+        SocketAddr::from((conf.interface.dns, 53)),
+        Protocol::Udp,
+    ));
+    let resolver = TokioAsyncResolver::tokio(resolver_conf, ResolverOpts::default());
 
     let endpoint_ip = match IpAddr::from_str(&peer.endpoint.0) {
         Ok(ip) => ip,
