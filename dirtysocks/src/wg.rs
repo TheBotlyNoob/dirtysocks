@@ -116,7 +116,7 @@ impl Peer {
             () = sleep.as_mut() => {
                 sleep.reset(Instant::now() + Duration::from_millis(250));
 
-                self.update_timers(recv_buf).await.unwrap();
+                self.update_timers(recv_buf).await?;
             }
         }
 
@@ -132,7 +132,15 @@ impl Peer {
             TunnResult::WriteToNetwork(packet) => {
                 tracing::trace!(num_bytes = packet.len(), "writing to peer network");
 
-                assert_eq!(self.conn.send(packet).await.unwrap(), packet.len());
+                let sent = self.conn.send(packet).await?;
+                if sent < packet.len() {
+                    tracing::warn!(
+                        sent = sent,
+                        total = packet.len(),
+                        "failed to send entire packet"
+                    );
+                    self.tx_queue.push_front(packet[sent..].to_vec());
+                }
 
                 Ok(())
             }

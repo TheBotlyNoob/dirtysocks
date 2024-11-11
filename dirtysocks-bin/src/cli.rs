@@ -5,8 +5,7 @@ use std::{
 
 use clap::Parser;
 
-/// A usermode WireGuard implementation with a
-/// SOCKS5 proxy.
+/// A usermode WireGuard implementation with a SOCKS5 proxy.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 pub struct Args {

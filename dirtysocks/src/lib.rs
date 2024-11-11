@@ -69,6 +69,8 @@ pub enum Error {
     InvalidAddressType,
     #[error("invalid command type")]
     InvalidCommandType,
+    #[error("failed to message worker thread")]
+    SendError,
     #[error("invalid string")]
     Utf8(#[from] std::str::Utf8Error),
     #[error("dns lookup error: {0}")]
@@ -243,13 +245,30 @@ impl Server {
 
         tracing::trace!(?socket_addr, "connected to remote");
 
-        sender
+        if sender
             .send(ToWgMsg::Connect(socket_addr, socket_tx))
             .await
-            .unwrap();
+            .is_err()
+        {
+            tracing::error!("error sending connect message to iface");
+            return Err(Error::SendError);
+        };
+
+        match socket_rx.recv().await {
+            Some(FromWgMsg::Connect(handle)) => {
+                tracing::trace!(handle = ?handle, "allocated handle");
+            }
+            Some(FromWgMsg::Close) => {
+                tracing::warn!("spurious close message");
+                return Ok(());
+            }
+            _ => {
+                return Err(Error::SendError);
+            }
+        }
 
         let Some(FromWgMsg::Connect(handle)) = socket_rx.recv().await else {
-            return Err(Error::UnexpectedEOI);
+            return Err(Error::SendError);
         };
 
         tracing::trace!(handle = ?handle, "allocated handle");
@@ -300,14 +319,17 @@ impl Server {
                         break;
                     }
 
-                    sender.send(
+                    if sender.send(
                         ToWgMsg::Data(
                             handle,
                             pipe.buf[..read].to_vec().into_boxed_slice()
                         )
                     )
                     .await
-                    .unwrap();
+                    .is_err() {
+                        tracing::error!("error sending data to iface");
+                        break;
+                    };
                 }
                 () = flush_next.map_or_else(
                     || Either::Left(std::future::pending()),
@@ -433,16 +455,16 @@ impl IfaceHandler {
 
         if socket.can_recv() {
             tracing::trace!(handle = ?handle,  queue_size = socket.recv_queue(), "socket can recv");
-            socket
-                .recv(|buf| {
-                    tracing::trace!(handle = ?handle, read = buf.len(), "read data from socket");
-                    let data = buf.to_vec().into_boxed_slice();
+            if let Err(e) = socket.recv(|buf| {
+                tracing::trace!(handle = ?handle, read = buf.len(), "read data from socket");
+                let data = buf.to_vec().into_boxed_slice();
 
-                    messages[0] = Some(FromWgMsg::Data(data));
+                messages[0] = Some(FromWgMsg::Data(data));
 
-                    (buf.len(), ())
-                })
-                .unwrap();
+                (buf.len(), ())
+            }) {
+                tracing::warn!(?e, "error reading from socket");
+            };
         }
 
         if socket.can_send() {
@@ -453,7 +475,7 @@ impl IfaceHandler {
             while let Some(data) = ctx.send_queue.pop() {
                 tracing::trace!(handle = ?handle, data_len = data.len(), "sending data");
 
-                let sent = socket.send_slice(&data).unwrap();
+                let sent = socket.send_slice(&data).unwrap_or(0);
 
                 if sent < data.len() {
                     ctx.send_queue
@@ -503,19 +525,24 @@ impl IfaceHandler {
                 socket.set_nagle_enabled(false);
                 socket.set_keep_alive(Some(SmolDuration::from_secs(30)));
 
-                socket
-                    .connect(
-                        self.iface.context(),
-                        (IpAddress::from(addr.ip()), addr.port()),
-                        self.next_ephemeral_port.get(),
-                    )
-                    .unwrap();
+                if let Err(e) = socket.connect(
+                    self.iface.context(),
+                    (IpAddress::from(addr.ip()), addr.port()),
+                    self.next_ephemeral_port.get(),
+                ) {
+                    tracing::warn!(?e, "error connecting to address");
+
+                    return;
+                }
 
                 self.next_ephemeral_port = self.next_ephemeral_port.saturating_add(1);
 
                 let handle = self.socket_set.add(socket);
 
-                sender.send(FromWgMsg::Connect(handle)).await.unwrap();
+                if sender.send(FromWgMsg::Connect(handle)).await.is_err() {
+                    tracing::error!("error sending connect message to socket");
+                    self.socket_set.get_mut::<tcp::Socket>(handle).abort();
+                }
 
                 self.sockets_ctx.insert(
                     handle,
@@ -532,7 +559,14 @@ impl IfaceHandler {
                     if socket.can_send() {
                         tracing::trace!(handle = ?handle, data_len = data.len(), "socket can send");
 
-                        socket.send_slice(&data).unwrap();
+                        let sent = socket.send_slice(&data).unwrap_or(0);
+
+                        if sent < data.len() {
+                            tracing::trace!(handle = ?handle, data_len = data.len(), sent, "socket can't send all data, queueing");
+
+                            ctx.send_queue
+                                .push(data[sent..].to_vec().into_boxed_slice());
+                        }
                     } else {
                         tracing::trace!(handle = ?handle, "socket can't send, queueing data");
 
