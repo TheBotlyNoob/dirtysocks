@@ -18,7 +18,7 @@ use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 use clap::Parser;
-use color_eyre::eyre::{ContextCompat, Result};
+use color_eyre::eyre::{eyre, ContextCompat, Result};
 
 mod cli;
 mod conf;
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     };
 
     dirtysocks::Server::listen(ServerOptions {
-        listener: TcpListener::bind(args.host).await.unwrap(),
+        listener: TcpListener::bind(args.host).await?,
         endpoint_addr: SocketAddr::from((endpoint_ip, peer.endpoint.1)),
         tunn: Tunn::new(
             StaticSecret::from(conf.interface.private_key),
@@ -74,8 +74,8 @@ async fn main() -> Result<()> {
             0,
             None,
         )
-        .unwrap(),
-        iface_addrs: heapless::Vec::from_slice(&peer.allowed_ips)
+        .map_err(|e| eyre!("failed to create Tunn: {}", e))?,
+        iface_addrs: heapless::Vec::from_slice(&conf.interface.addresses)
             .ok()
             .context("too many interface addresses")?,
         timeout: Duration::from_secs(30),
