@@ -153,32 +153,40 @@ impl Peer {
     pub async fn handle_peer_rx_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
         tracing::trace!(len = packet.len(), "recieved packet peer");
 
-        let result = self.tunn.decapsulate(None, packet, &mut self.buf);
+        let mut res = self.tunn.decapsulate(None, packet, &mut self.buf);
 
-        match result {
-            TunnResult::WriteToNetwork(packet) => {
-                tracing::trace!(num_bytes = packet.len(), "writing to peer network");
+        loop {
+            match res {
+                TunnResult::WriteToNetwork(packet) => {
+                    tracing::trace!(num_bytes = packet.len(), "writing to peer network");
 
-                assert_eq!(self.conn.send(packet).await?, packet.len());
-                self.needs_final_dispatch = true;
+                    assert_eq!(self.conn.send(packet).await?, packet.len());
+                    self.needs_final_dispatch = true;
 
-                Ok(())
+                    break Ok(());
+                }
+
+                TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    tracing::trace!("WRITE TO SMOL DEVICE");
+
+                    self.rx_queue.push_front(packet.to_vec());
+                    self.should_poll = true;
+
+                    break Ok(());
+                }
+
+                TunnResult::Done => {
+                    self.needs_final_dispatch = false;
+                    break Ok(());
+                }
+
+                TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                    res = self.tunn.format_handshake_initiation(&mut self.buf, true);
+                    continue;
+                }
+
+                TunnResult::Err(e) => break Err(e.into()),
             }
-
-            TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                tracing::trace!("WRITE TO SMOL DEVICE");
-
-                self.rx_queue.push_front(packet.to_vec());
-                self.should_poll = true;
-
-                Ok(())
-            }
-
-            TunnResult::Done => {
-                self.needs_final_dispatch = false;
-                Ok(())
-            }
-            TunnResult::Err(e) => Err(e.into()),
         }
     }
 
@@ -187,22 +195,38 @@ impl Peer {
     pub async fn update_timers(&mut self, buf: &mut [u8]) -> Result<(), Error> {
         //tracing::debug!("updating timers...");
 
-        let res = self.tunn.update_timers(buf);
-        match res {
-            TunnResult::WriteToNetwork(packet) => {
-                tracing::trace!(num_bytes = packet.len(), "writing to peer network");
+        let mut res = self.tunn.update_timers(buf);
 
-                assert_eq!(self.conn.send(packet).await?, packet.len());
+        loop {
+            match res {
+                TunnResult::WriteToNetwork(packet) => {
+                    tracing::trace!(num_bytes = packet.len(), "writing to peer network");
 
-                Ok(())
+                    assert_eq!(self.conn.send(packet).await?, packet.len());
+
+                    break Ok(());
+                }
+
+                TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    tracing::trace!("WRITE TO SMOL DEVICE");
+
+                    self.rx_queue.push_front(packet.to_vec());
+                    self.should_poll = true;
+
+                    break Ok(());
+                }
+
+                TunnResult::Done => {
+                    break Ok(());
+                }
+
+                TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                    res = self.tunn.format_handshake_initiation(&mut self.buf, true);
+                    continue;
+                }
+
+                TunnResult::Err(e) => break Err(e.into()),
             }
-
-            TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
-                unreachable!()
-            }
-
-            TunnResult::Done => Ok(()),
-            TunnResult::Err(e) => Err(e.into()),
         }
     }
 }
