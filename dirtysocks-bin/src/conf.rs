@@ -43,7 +43,10 @@ impl Conf {
             .flat_map(IpCidr::from_str)
             .collect::<Vec<_>>();
         let dns = interface.get("DNS").context(n!("DNS"))?.parse()?;
-        let mtu = interface.get("MTU").context(n!("MTU"))?.parse()?;
+        let mtu = interface
+            .get("MTU")
+            .and_then(|mtu| mtu.parse().ok())
+            .unwrap_or(1280);
 
         let interface = Interface {
             private_key,

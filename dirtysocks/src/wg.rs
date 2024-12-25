@@ -95,6 +95,8 @@ impl Peer {
             ready = self.conn.readable() => {
                 ready?;
 
+                tracing::info!("READABLE");
+
                 loop {
                     match self.conn.try_recv(recv_buf) {
                         Ok(len) => {
@@ -145,7 +147,10 @@ impl Peer {
                 Ok(())
             }
             TunnResult::Err(e) => Err(e.into()),
-            _ => Ok(()),
+            res => {
+                tracing::warn!(?res, "unexpected result from encapsulation");
+                Ok(())
+            }
         }
     }
 
@@ -181,6 +186,7 @@ impl Peer {
                 }
 
                 TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                    tracing::debug!("connection expired; re-handshaking");
                     res = self.tunn.format_handshake_initiation(&mut self.buf, true);
                     continue;
                 }

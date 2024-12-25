@@ -408,6 +408,8 @@ impl IfaceHandler {
     }
 
     async fn poll_iface(&mut self) {
+        tracing::info!("polling");
+
         self.last_iface_poll = StdInstant::now();
         let smoltcp_now = SmolInstant::from(self.last_iface_poll);
 

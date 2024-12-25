@@ -46,16 +46,9 @@ async fn main() -> Result<()> {
         panic!("only one peer is allowed")
     };
 
-    let mut resolver_conf = ResolverConfig::new();
-    resolver_conf.add_name_server(NameServerConfig::new(
-        SocketAddr::from((conf.interface.dns, 53)),
-        Protocol::Udp,
-    ));
-    let resolver = TokioAsyncResolver::tokio(resolver_conf, ResolverOpts::default());
-
     let endpoint_ip = match IpAddr::from_str(&peer.endpoint.0) {
         Ok(ip) => ip,
-        Err(_) => resolver
+        Err(_) => TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default())
             .lookup_ip(&peer.endpoint.0)
             .await?
             .iter()
@@ -63,6 +56,14 @@ async fn main() -> Result<()> {
             .context("no IPs found for endpoint address")?,
     };
 
+    // TODO: use custom resolver
+    // let mut resolver_conf = ResolverConfig::new();
+    // resolver_conf.add_name_server(NameServerConfig::new(
+    //     SocketAddr::from((conf.interface.dns, 53)),
+    //     Protocol::Udp,
+    // ));
+    let resolver_conf = ResolverConfig::cloudflare();
+    let resolver = TokioAsyncResolver::tokio(resolver_conf, ResolverOpts::default());
     dirtysocks::Server::listen(ServerOptions {
         listener: TcpListener::bind(args.host).await?,
         endpoint_addr: SocketAddr::from((endpoint_ip, peer.endpoint.1)),
